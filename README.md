@@ -3,14 +3,14 @@
 **Three complete LLM projects written in 100% pure x86-64 NASM assembly.**
 Zero C, zero C++, zero Rust, zero libc, zero libm, zero runtime dependencies.
 
-Assembled directly with `nasm` and linked with `ld`. Every math kernel (`expf`, `sincosf`, `RMSNorm`, `RoPE`, `SiLU`, `Softmax`), AVX2+FMA GEMM/GEMV engine, BPE tokenizer, `clone()`/`futex()` thread pool, bare-metal SMP kernel, analytical backward pass, AdamW optimizer, and live Unicode Braille TUI is hand-written x86-64 assembly (`15,778` lines total across all three projects).
+Assembled directly with `nasm` and linked with `ld`. Every math kernel (`expf`, `sincosf`, `RMSNorm`, `RoPE`, `SiLU`, `Softmax`), AVX2+FMA GEMM/GEMV engine, BPE tokenizer, `clone()`/`futex()` thread pool, bare-metal SMP kernel, analytical backward pass, AdamW optimizer, and live Unicode Braille TUI is hand-written x86-64 assembly (`16,275` lines total across all three projects).
 
 ## The Trilogy
 
 | Project | Binary | Size | Deps | Key Numbers |
 |---|---|---:|---:|---|
-| **[01-qwen3-inference/](01-qwen3-inference/)** | `build/asm-llm` | **12,120 B** | **0** | Static Linux ELF running `Qwen/Qwen3-0.6B` (Q8_0, built-in BPE tokenizer, GQA + QK-Norm + RoPE + SwiGLU). **105.4 tok/s** peak decode, **`1.000000000`** cosine vs Q8_0 ref, **64/64** exact greedy token match vs PyTorch FP32. |
-| **[02-baremetal-os/](02-baremetal-os/)** | `build/asm-llm-os.elf` | **22,492 B** | **0** | Bootable bare-metal `Qwen3-0.6B` OS with no Linux or Windows. Multiboot 1 -> Long Mode -> AVX2/FMA -> ACPI/APIC SMP -> VGA + PS/2 + COM1 console. **85 ms** boot, **100.1 tok/s** KVM EPYC, **55.4 tok/s** live on Proxmox Xeon E5-2670 v3 with **0 GB** disk. |
+| **[01-qwen3-inference/](01-qwen3-inference/)** | `build/asm-llm` | **13,528 B** | **0** | Static Linux ELF running `Qwen/Qwen3-0.6B` (Q8_0, built-in BPE tokenizer, GQA + QK-Norm + RoPE + SwiGLU, single-shot & `--chat` multi-turn KV-cache REPL). **105.4 tok/s** peak decode, **`1.000000000`** cosine vs Q8_0 ref, **64/64** exact greedy token match vs PyTorch FP32. |
+| **[02-baremetal-os/](02-baremetal-os/)** | `build/asm-llm-os.elf` | **23,132 B** | **0** | Bootable bare-metal `Qwen3-0.6B` OS with no Linux or Windows. Multiboot 1 -> Long Mode -> AVX2/FMA -> ACPI/APIC SMP -> VGA + PS/2 + COM1 multi-turn KV-cache chat (`/clear`, `/think`, `/bench`). **85 ms** boot, **100.1 tok/s** KVM EPYC, **55.4 tok/s** live on Proxmox Xeon E5-2670 v3 with **0 GB** disk. |
 | **[03-minigpt-train/](03-minigpt-train/)** | `build/asm-gpt-train` | **32,752 B** | **0** | From-scratch FP32 Mini-GPT trainer and sampler. Register-blocked `6x16` AVX2+FMA SGEMM, full analytical backward pass (**`1.0000000000`** cosine across all 21 gradient tensors vs PyTorch CPU), decoupled AdamW, **27,662 train tok/s**, live 80x24 Braille TUI, `val_loss 4.19 -> 1.51` on TinyShakespeare in 4 min. |
 
 ---
@@ -66,17 +66,19 @@ cd llm.asm
 make all
 ```
 
-### 1. Run Qwen3-0.6B Inference in 12 KB (`01-qwen3-inference/`)
+### 1. Run Qwen3-0.6B Inference in 13 KB (`01-qwen3-inference/`)
 
 ```bash
 python3 scripts/export_weights.py --model-dir models/qwen3-0.6b-bf16 --out models/qwen3-0.6b-q8_0.asmbin
 make inference
 ./build/asm-llm -m models/qwen3-0.6b-q8_0.asmbin -p "Explain how a CPU cache works in 3 concise sentences." -n 128 -t 16
+# Or start an interactive multi-turn chat preserving the KV-cache across turns:
+./build/asm-llm -m models/qwen3-0.6b-q8_0.asmbin --chat -t 16
 ```
 
 Full step-by-step setup, model download, CLI flags, and benchmarks: **[01-qwen3-inference/README.md](01-qwen3-inference/README.md)**.
 
-### 2. Boot Bare-Metal Qwen3-0.6B OS in 22 KB (`02-baremetal-os/`)
+### 2. Boot Bare-Metal Qwen3-0.6B OS in 23 KB (`02-baremetal-os/`)
 
 ```bash
 make os
@@ -119,15 +121,15 @@ llm.asm/
 │   ├── threads.asm                # Zero-libc Linux clone() + futex() lock-free thread pool
 │   ├── tokenizer.asm              # Fibonacci-hashed BPE encoder, UTF-8 decoder, Qwen3 chat template
 │   └── transformer.asm            # Full 28-layer Qwen3 forward pass (mmap & bare-metal zero-copy)
-├── 01-qwen3-inference/            # Phase 1: 12 KB static Linux ELF inference engine (865 lines)
+├── 01-qwen3-inference/            # Phase 1: 13 KB static Linux ELF inference engine + --chat (1,218 lines)
 │   ├── README.md
 │   ├── main.asm
 │   └── test_math.asm
-├── 02-baremetal-os/               # Phase 2: 22 KB bare-metal bootable LLM OS (3,914 lines)
+├── 02-baremetal-os/               # Phase 2: 23 KB bare-metal bootable LLM OS (4,058 lines)
 │   ├── README.md
 │   ├── boot.asm                   # Multiboot 1 -> 4-level paging -> Long Mode -> AVX2/FMA -> IDT
 │   ├── drivers.asm                # COM1 115200, 80x25 Color VGA, PS/2 keyboard, PIT+RDTSC, ACPI poweroff
-│   ├── kernel.asm                 # Kernel entrypoint, CPUID banner, cmdline parser, interactive REPL
+│   ├── kernel.asm                 # Kernel entrypoint, CPUID banner, cmdline parser, multi-turn chat REPL
 │   ├── linker.ld                  # Bare-metal linker script at 0x00100000
 │   ├── os_constants.inc           # Hardware, Multiboot 1, Local APIC, and SMP constants
 │   ├── runtime.asm                # Multiboot mmap bump allocator + bare-metal formatting runtime

@@ -97,8 +97,10 @@ kernel_main:
     mov     qword [rel opt_req_threads], 0 ; 0 = all online SMP cores
     mov     dword [rel opt_think], 0
     mov     dword [rel opt_raw], 0
+    mov     dword [rel opt_single_turn], 0
     mov     dword [rel opt_shutdown], 0
     mov     dword [rel opt_print_toks], 0
+    mov     qword [rel g_chat_pos], 0
     mov     dword [rel opt_temp], 0     ; 0.0f = greedy argmax
     mov     eax, 0x3F733333             ; 0.95f
     mov     [rel opt_topp], eax
@@ -282,6 +284,25 @@ kernel_main:
     test    eax, eax
     jnz     .do_halt
 
+    ; /clear, /new, /reset — reset multi-turn KV-cache history
+    mov     rdi, r12
+    lea     rsi, [rel cmd_clear]
+    call    str_eq
+    test    eax, eax
+    jnz     .do_clear
+
+    mov     rdi, r12
+    lea     rsi, [rel cmd_new]
+    call    str_eq
+    test    eax, eax
+    jnz     .do_clear
+
+    mov     rdi, r12
+    lea     rsi, [rel cmd_reset]
+    call    str_eq
+    test    eax, eax
+    jnz     .do_clear
+
     ; /think
     mov     rdi, r12
     lea     rsi, [rel cmd_think]
@@ -293,6 +314,22 @@ kernel_main:
     call    vga_set_color
     mov     edi, 1
     lea     rsi, [rel msg_think_on]
+    call    write_cstr
+    jmp     .repl_loop
+
+.do_clear:
+    mov     qword [rel g_chat_pos], 0
+    mov     dil, VGA_ATTR_CYAN
+    call    vga_set_color
+    mov     edi, 1
+    lea     rsi, [rel msg_chat_cleared]
+    call    write_cstr
+    lea     rax, [rel g_ctx]
+    mov     edi, 1
+    mov     rsi, [rax + CTX_MAX_SEQ]
+    call    write_u64
+    mov     edi, 1
+    lea     rsi, [rel msg_close_nl]
     call    write_cstr
     jmp     .repl_loop
 
@@ -317,11 +354,16 @@ kernel_main:
     test    eax, eax
     jz      .chk_help
     mov     r13, [rel opt_max_tok]
+    mov     r14d, [rel opt_single_turn]
     mov     qword [rel opt_max_tok], 64
+    mov     dword [rel opt_single_turn], 1
+    mov     qword [rel g_chat_pos], 0
     lea     rdi, [rel bench_prompt]
     xor     esi, esi
     call    run_inference
     mov     [rel opt_max_tok], r13
+    mov     [rel opt_single_turn], r14d
+    mov     qword [rel g_chat_pos], 0
     jmp     .repl_loop
 
 .chk_help:
@@ -405,6 +447,31 @@ run_inference:
     test    r12, r12
     jz      .done
 
+    ; Multi-turn KV-cache management
+    cmp     dword [rel opt_single_turn], 0
+    je      .chk_ctx_room
+    mov     qword [rel g_chat_pos], 0
+    jmp     .ctx_room_ok
+.chk_ctx_room:
+    mov     rax, [rel g_chat_pos]
+    test    rax, rax
+    jz      .ctx_room_ok
+    lea     rcx, [rax + r12 + 64]
+    cmp     rcx, [rbp + CTX_MAX_SEQ]
+    jb      .ctx_room_ok
+    mov     qword [rel g_chat_pos], 0
+    mov     dil, VGA_ATTR_YELLOW
+    call    vga_set_color
+    mov     edi, 1
+    lea     rsi, [rel msg_ctx_full]
+    call    write_cstr
+.ctx_room_ok:
+    mov     rax, [rbp + CTX_MAX_SEQ]
+    cmp     r12, rax
+    jbe     .prompt_len_ok
+    mov     r12, rax
+.prompt_len_ok:
+
     ; Optional PROMPT_TOKENS output for automated exact verification
     cmp     dword [rel opt_print_toks], 0
     je      .do_prefill
@@ -415,23 +482,25 @@ run_inference:
     mov     rsi, r12
     call    write_tok_csv
 
-    ; --- PREFILL ---
+    ; --- PREFILL (incremental from pos = g_chat_pos, preserving KV-cache!) ---
 .do_prefill:
     call    timer_ns
     mov     [rel tm_prefill_start], rax
 
-    xor     r13d, r13d                  ; pos = 0
+    mov     r13, [rel g_chat_pos]       ; pos = g_chat_pos
+    xor     ebx, ebx                    ; i = 0
     mov     r14, [rbp + CTX_BUF_PROMPT]
 .prefill_lp:
-    cmp     r13, r12
+    cmp     rbx, r12
     jae     .prefill_done
-    mov     edi, [r14 + r13*4]
+    mov     edi, [r14 + rbx*4]
     mov     rsi, r13
-    lea     rax, [r13 + 1]
+    lea     rax, [rbx + 1]
     xor     edx, edx
     cmp     rax, r12
-    sete    dl                          ; compute_logits = (pos == n_prompt - 1)
+    sete    dl                          ; compute_logits = (i == n_prompt - 1)
     call    transformer_forward
+    inc     rbx
     inc     r13
     jmp     .prefill_lp
 
@@ -454,6 +523,7 @@ run_inference:
     call    timer_ns
     mov     [rel tm_decode_start], rax
 
+    mov     dword [rsp], 0              ; last_tok_unfed = 0
     xor     r15d, r15d                  ; n_gen = 0
     mov     rbx, [rel opt_max_tok]
 .decode_lp:
@@ -472,7 +542,7 @@ run_inference:
     call    tok_write_stdout
 
     cmp     r15, rbx
-    jae     .decode_done
+    jae     .decode_done_unfed
     cmp     r13, [rbp + CTX_MAX_SEQ]
     jae     .decode_done
 
@@ -486,6 +556,8 @@ run_inference:
     mov     r14, rax
     jmp     .decode_lp
 
+.decode_done_unfed:
+    mov     dword [rsp], 1              ; r14 was emitted on max_tok hit, not yet forwarded
 .decode_done:
     call    timer_ns
     mov     [rel tm_decode_end], rax
@@ -493,6 +565,46 @@ run_inference:
     mov     edi, 1
     lea     rsi, [rel msg_nl]
     call    write_cstr
+
+    ; Close assistant turn in KV-cache for seamless Qwen3 multi-turn continuity
+    cmp     dword [rel opt_single_turn], 0
+    jne     .reset_chat_after
+
+    ; If decode stopped at max_tokens, feed the last emitted token into KV-cache
+    cmp     dword [rsp], 0
+    je      .close_eot
+    cmp     r13, [rbp + CTX_MAX_SEQ]
+    jae     .save_chat_pos
+    mov     rdi, r14
+    mov     rsi, r13
+    xor     edx, edx                    ; compute_logits = 0
+    call    transformer_forward
+    inc     r13
+
+.close_eot:
+    ; Feed <|im_end|> (151645) and \n (198) so next turn's <|im_start|>user\n aligns exact
+    cmp     dword [rel opt_raw], 0
+    jne     .save_chat_pos
+    lea     rax, [r13 + 2]
+    cmp     rax, [rbp + CTX_MAX_SEQ]
+    jae     .save_chat_pos
+    mov     edi, TOK_IM_END
+    mov     rsi, r13
+    xor     edx, edx
+    call    transformer_forward
+    inc     r13
+    mov     edi, TOK_NL
+    mov     rsi, r13
+    xor     edx, edx
+    call    transformer_forward
+    inc     r13
+.save_chat_pos:
+    mov     [rel g_chat_pos], r13
+    jmp     .after_kv_close
+
+.reset_chat_after:
+    mov     qword [rel g_chat_pos], 0
+.after_kv_close:
 
     ; Optional GEN_TOKENS output for automated exact verification
     cmp     dword [rel opt_print_toks], 0
@@ -586,7 +698,19 @@ run_inference:
     mov     rsi, [rel g_active_cores]
     call    write_u64
     mov     edi, 1
-    lea     rsi, [rel msg_close_nl]
+    lea     rsi, [rel msg_ctx_lbl]
+    call    write_cstr
+    mov     edi, 1
+    mov     rsi, r13
+    call    write_u64
+    mov     edi, 1
+    lea     rsi, [rel msg_slash]
+    call    write_cstr
+    mov     edi, 1
+    mov     rsi, [rbp + CTX_MAX_SEQ]
+    call    write_u64
+    mov     edi, 1
+    lea     rsi, [rel msg_nl]
     call    write_cstr
 
     ; Optional boot-to-first-token line (batch mode)
@@ -1131,7 +1255,7 @@ parse_cmdline:
     lea     rsi, [rel key_seed]
     call    str_eq
     test    eax, eax
-    jz      .tok_lp
+    jz      .chk_single_turn
     lea     rdi, [rel cmd_val_buf]
     call    parse_u64
     test    rax, rax
@@ -1139,6 +1263,17 @@ parse_cmdline:
     mov     rax, 1
 .st_seed:
     mov     [rel opt_rng], rax
+    jmp     .tok_lp
+
+.chk_single_turn:
+    lea     rdi, [rel cmd_key_buf]
+    lea     rsi, [rel key_single_turn]
+    call    str_eq
+    test    eax, eax
+    jz      .tok_lp
+    lea     rdi, [rel cmd_val_buf]
+    call    parse_u64
+    mov     [rel opt_single_turn], eax
     jmp     .tok_lp
 
 .done:
@@ -1171,8 +1306,10 @@ ban_mod_at:     db " MiB @ 0x", 0
 ban_mod_ctx:    db ", 28L, ctx=", 0
 
 msg_prompt_lbl: db "Prompt: ", 0
-msg_repl_help:  db "Interactive Bare-Metal REPL (/think, /nothink, /bench, /halt, /help)", 10, 0
+msg_repl_help:  db "Interactive Bare-Metal Chat (/clear, /think, /nothink, /bench, /halt, /help)", 10, 0
 msg_repl_prompt: db 10, "asm-llm> ", 0
+msg_chat_cleared: db "[chat] history cleared (ctx=0/", 0
+msg_ctx_full:   db "[chat] context full, resetting KV-cache", 10, 0
 msg_think_on:   db "[mode] think=1 (Qwen3 reasoning enabled)", 10, 0
 msg_think_off:  db "[mode] think=0 (direct answer mode)", 10, 0
 msg_poweroff:   db "Powering off bare-metal VM...", 10, 0
@@ -1188,6 +1325,7 @@ msg_in:         db " tok in ", 0
 msg_ms_open:    db " ms (", 0
 msg_tps_end:    db " tok/s)", 10, 0
 msg_tps_cores:  db " tok/s, cores=", 0
+msg_ctx_lbl:    db ") ctx=", 0
 msg_close_nl:   db ")", 10, 0
 msg_boot_ttft:  db "[asm-llm-os] boot   : ready ", 0
 msg_ttft_mid:   db " ms | boot->1st-tok ", 0
@@ -1199,6 +1337,9 @@ bench_prompt:   db "Explain how a CPU cache works in 3 concise sentences.", 0
 cmd_halt:       db "/halt", 0
 cmd_quit:       db "/quit", 0
 cmd_exit:       db "exit", 0
+cmd_clear:      db "/clear", 0
+cmd_new:        db "/new", 0
+cmd_reset:      db "/reset", 0
 cmd_think:      db "/think", 0
 cmd_nothink:    db "/nothink", 0
 cmd_bench:      db "/bench", 0
@@ -1215,6 +1356,7 @@ key_print_tokens: db "print_tokens", 0
 key_temp:         db "temp", 0
 key_topp:         db "topp", 0
 key_seed:         db "seed", 0
+key_single_turn:  db "single_turn", 0
 
 msg_err_avx2:   db "[FATAL] CPU lacks AVX2+FMA+XSAVE (use QEMU -cpu host)", 10, 0
 msg_err_mb:     db "[FATAL] Invalid Multiboot 1 magic", 10, 0
@@ -1232,6 +1374,7 @@ g_mod_start:      resq 1
 g_mod_end:        resq 1
 g_mod_size:       resq 1
 g_active_cores:   resq 1
+g_chat_pos:       resq 1
 
 opt_max_tok:      resq 1
 opt_ctx_len:      resq 1
@@ -1241,6 +1384,7 @@ opt_temp:         resd 1
 opt_topp:         resd 1
 opt_think:        resd 1
 opt_raw:          resd 1
+opt_single_turn:  resd 1
 opt_shutdown:     resd 1
 opt_print_toks:   resd 1
 opt_has_prompt:   resd 1

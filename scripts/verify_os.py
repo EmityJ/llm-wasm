@@ -47,7 +47,7 @@ def parse_os_output(raw_bytes: bytes):
     m_smp = re.search(r"SMP\s*:\s*(\d+)/(\d+)\s+x86-64 cores online", text)
     m_boot = re.search(r"\[asm-llm-os\] boot\s*:\s*ready\s+([0-9.]+)\s+ms\s*\|\s*boot->1st-tok\s+([0-9.]+)\s+ms", text)
     m_pf = re.search(r"\[asm-llm-os\] prefill:\s*(\d+)\s+tok in\s+([0-9.]+)\s+ms\s*\(([0-9.]+)\s+tok/s\)", text)
-    m_dec = re.search(r"\[asm-llm-os\] decode\s*:\s*(\d+)\s+tok in\s+([0-9.]+)\s+ms\s*\(([0-9.]+)\s+tok/s,\s*cores=(\d+)\)", text)
+    m_dec = re.search(r"\[asm-llm-os\] decode\s*:\s*(\d+)\s+tok in\s+([0-9.]+)\s+ms\s*\(([0-9.]+)\s+tok/s,\s*cores=(\d+)\)(?:\s*ctx=(\d+)/(\d+))?", text)
     m_p = re.search(r"PROMPT_TOKENS:([0-9,]+)", text)
     m_g = re.search(r"GEN_TOKENS:([0-9,]+)", text)
 
@@ -81,6 +81,8 @@ def parse_os_output(raw_bytes: bytes):
         "decode_ms": float(m_dec.group(2)) if m_dec else 0.0,
         "decode_tps": float(m_dec.group(3)) if m_dec else 0.0,
         "cores": int(m_dec.group(4)) if m_dec else 0,
+        "ctx_used": int(m_dec.group(5)) if (m_dec and m_dec.group(5)) else 0,
+        "ctx_max": int(m_dec.group(6)) if (m_dec and m_dec.group(6)) else 0,
     }
 
 
@@ -174,6 +176,160 @@ def test_repl(model: str, smp: int = 16):
             proc.wait()
 
 
+def test_multiturn_os(model: str, smp: int = 16):
+    cmd = [
+        "qemu-system-x86_64",
+        "-enable-kvm", "-cpu", "host",
+        "-m", "2G", "-smp", str(smp),
+        "-kernel", OS_ELF,
+        "-initrd", model,
+        "-append", "max_tokens=64 think=0",
+        "-nographic",
+    ]
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=0,
+    )
+    buf = b""
+
+    def read_until(marker: bytes, timeout: float = 30.0):
+        nonlocal buf
+        deadline = time.monotonic() + timeout
+        while marker not in buf:
+            rem = deadline - time.monotonic()
+            if rem <= 0:
+                proc.kill()
+                raise TimeoutError(
+                    f"Timed out waiting for {marker!r}; got tail:\n{buf[-500:].decode('utf-8', 'replace')}"
+                )
+            r, _, _ = select.select([proc.stdout], [], [], min(rem, 0.25))
+            if r:
+                chunk = os.read(proc.stdout.fileno(), 4096)
+                if not chunk:
+                    break
+                buf += chunk
+
+    def send_and_read(line: str) -> str:
+        nonlocal buf
+        proc.stdin.write((line + "\n").encode("utf-8"))
+        proc.stdin.flush()
+        read_until(b"asm-llm> ", timeout=30.0)
+        part, buf = buf.split(b"asm-llm> ", 1)
+        return part.decode("utf-8", errors="replace").strip()
+
+    try:
+        read_until(b"asm-llm> ", timeout=30.0)
+        buf = buf.split(b"asm-llm> ", 1)[1]
+
+        t1 = send_and_read("My name is Alex and my favorite number is 42. Reply with just OK.")
+        t2 = send_and_read("What is my name and what is my favorite number?")
+        t3 = send_and_read("/clear")
+        t4 = send_and_read("What is my name?")
+
+        proc.stdin.write(b"/halt\n")
+        proc.stdin.flush()
+        rest, _ = proc.communicate(timeout=15.0)
+        shutdown_msg = (buf + rest).decode("utf-8", errors="replace").strip()
+
+        c1 = re.search(r"ctx=(\d+)/(\d+)", t1)
+        c2 = re.search(r"ctx=(\d+)/(\d+)", t2)
+        c4 = re.search(r"ctx=(\d+)/(\d+)", t4)
+        ctx1 = int(c1.group(1)) if c1 else 0
+        ctx2 = int(c2.group(1)) if c2 else 0
+        ctx4 = int(c4.group(1)) if c4 else 0
+
+        ok = (
+            proc.returncode == 0
+            and "Alex" in t2
+            and "42" in t2
+            and "[chat] history cleared" in t3
+            and "Alex" not in t4
+            and ctx1 > 0
+            and ctx2 > ctx1
+            and ctx4 > 0
+            and ctx4 < ctx2
+            and "Powering off" in shutdown_msg
+        )
+        return {
+            "ok": ok,
+            "returncode": proc.returncode,
+            "turn1": t1,
+            "turn2": t2,
+            "turn3_clear": t3,
+            "turn4_after_clear": t4,
+            "shutdown_msg": shutdown_msg,
+            "ctx": (ctx1, ctx2, ctx4),
+        }
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+
+def test_multiturn_phase1(model: str, threads: int = 16):
+    cmd = [
+        PHASE1_BIN,
+        "-m", model,
+        "--chat",
+        "-n", "64",
+        "-t", str(threads),
+    ]
+    script_in = (
+        "My name is Alex and my favorite number is 42. Reply with just OK.\n"
+        "What is my name and what is my favorite number?\n"
+        "/clear\n"
+        "What is my name?\n"
+        "/quit\n"
+    ).encode("utf-8")
+    res = subprocess.run(
+        cmd,
+        input=script_in,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=60,
+        check=True,
+    )
+    transcript = res.stdout.decode("utf-8", errors="replace")
+    parts = transcript.split("asm-llm> ")
+    # parts[0] = banner, parts[1] = turn1, parts[2] = turn2, parts[3] = /clear, parts[4] = turn4, parts[5] = /quit
+    t1 = parts[1].strip() if len(parts) > 1 else ""
+    t2 = parts[2].strip() if len(parts) > 2 else ""
+    t3 = parts[3].strip() if len(parts) > 3 else ""
+    t4 = parts[4].strip() if len(parts) > 4 else ""
+
+    c1 = re.search(r"ctx=(\d+)/(\d+)", t1)
+    c2 = re.search(r"ctx=(\d+)/(\d+)", t2)
+    c4 = re.search(r"ctx=(\d+)/(\d+)", t4)
+    ctx1 = int(c1.group(1)) if c1 else 0
+    ctx2 = int(c2.group(1)) if c2 else 0
+    ctx4 = int(c4.group(1)) if c4 else 0
+
+    ok = (
+        res.returncode == 0
+        and "Alex" in t2
+        and "42" in t2
+        and "[chat] history cleared" in t3
+        and "Alex" not in t4
+        and ctx1 > 0
+        and ctx2 > ctx1
+        and ctx4 > 0
+        and ctx4 < ctx2
+    )
+    return {
+        "ok": ok,
+        "returncode": res.returncode,
+        "turn1": t1,
+        "turn2": t2,
+        "turn3_clear": t3,
+        "turn4_after_clear": t4,
+        "ctx": (ctx1, ctx2, ctx4),
+        "raw": transcript,
+    }
+
+
 def capture_vga_screenshot(model: str, out_dir: Path, smp: int = 16):
     from PIL import Image
 
@@ -263,13 +419,32 @@ def main():
     ap.add_argument("--model", default=MODEL_DEFAULT)
     ap.add_argument("--run-dir", required=True)
     ap.add_argument("--only-vga", action="store_true")
+    ap.add_argument("--only-chat", action="store_true")
+    ap.add_argument("--max-threads", type=int, default=32)
     args = ap.parse_args()
 
     out_dir = Path(args.run_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     if args.only_vga:
-        png_path, size = capture_vga_screenshot(args.model, out_dir, smp=16)
+        png_path, size = capture_vga_screenshot(args.model, out_dir, smp=min(16, args.max_threads))
         print(f"[PASS] Saved VGA screenshot: {png_path} ({size[0]}x{size[1]}, {png_path.stat().st_size} bytes)")
+        return
+    if args.only_chat:
+        smp = min(16, args.max_threads)
+        mt_os = test_multiturn_os(args.model, smp=smp)
+        mt_p1 = test_multiturn_phase1(args.model, threads=smp)
+        print(f"[{'PASS' if mt_os['ok'] else 'FAIL'}] Phase 2 Bare-Metal Multi-Turn Chat (smp={smp}, ctx={mt_os['ctx']})")
+        print("--- OS Turn 1 ---\n" + mt_os["turn1"])
+        print("--- OS Turn 2 (Memory Recall) ---\n" + mt_os["turn2"])
+        print("--- OS /clear ---\n" + mt_os["turn3_clear"])
+        print("--- OS Turn 4 (After /clear) ---\n" + mt_os["turn4_after_clear"])
+        print(f"\n[{'PASS' if mt_p1['ok'] else 'FAIL'}] Phase 1 Linux --chat Multi-Turn (threads={smp}, ctx={mt_p1['ctx']})")
+        print("--- P1 Turn 1 ---\n" + mt_p1["turn1"])
+        print("--- P1 Turn 2 (Memory Recall) ---\n" + mt_p1["turn2"])
+        print("--- P1 /clear ---\n" + mt_p1["turn3_clear"])
+        print("--- P1 Turn 4 (After /clear) ---\n" + mt_p1["turn4_after_clear"])
+        if not (mt_os["ok"] and mt_p1["ok"]):
+            sys.exit(1)
         return
     log_path = out_dir / "report.log"
     lines = []
@@ -292,9 +467,11 @@ def main():
         ("Think-Mode-192", "What is 17 * 23?", 192, True),
     ]
     all_parity_ok = True
+    p1_threads = min(32, args.max_threads)
+    os_smp = min(16, args.max_threads)
     for name, prompt, max_tok, think in prompts:
-        p1 = run_phase1(args.model, prompt, max_tok, think=think, threads=32)
-        os_res = run_os_batch(args.model, prompt, max_tok, smp=16, think=think, print_tokens=True)
+        p1 = run_phase1(args.model, prompt, max_tok, think=think, threads=p1_threads)
+        os_res = run_os_batch(args.model, prompt, max_tok, smp=os_smp, think=think, print_tokens=True)
         ptok_ok = (p1["prompt_tokens"] == os_res["prompt_tokens"]) and bool(p1["prompt_tokens"])
         gtok_ok = (p1["gen_tokens"] == os_res["gen_tokens"]) and bool(p1["gen_tokens"])
         text_ok = (p1["text"] == os_res["text"])
@@ -317,12 +494,12 @@ def main():
     # 2. SMP Determinism & KVM Scaling Benchmark (1, 4, 8, 16, 24, 32 vCPUs)
     log("\n=== 2. BARE-METAL SMP SCALING & DETERMINISM BENCHMARK (QEMU KVM, AMD EPYC 7642) ===")
     bench_prompt = "Explain the difference between L1, L2, and L3 CPU caches and why cache locality matters."
-    ref_p1 = run_phase1(args.model, bench_prompt, 64, think=False, threads=32)
+    ref_p1 = run_phase1(args.model, bench_prompt, 64, think=False, threads=p1_threads)
     log(f"Prompt: {bench_prompt!r} (34 prompt tok, 64 gen tok, greedy)")
     log(f"{'vCPUs':>5s} | {'Online':>6s} | {'Boot(ms)':>8s} | {'Boot->1st':>9s} | {'Prefill ms':>10s} | {'Prefill t/s':>11s} | {'Decode ms':>9s} | {'Decode t/s':>10s} | {'QEMU Wall':>9s} | Determinism")
     log("-" * 116)
     smp_all_ok = True
-    for smp in (1, 4, 8, 16, 24, 32):
+    for smp in [s for s in (1, 4, 8, 16, 24, 32) if s <= args.max_threads]:
         r = run_os_batch(args.model, bench_prompt, 64, smp=smp, think=False, print_tokens=True, timeout_s=120)
         online_ok = (r["smp_online"] == smp)
         det_ok = (r["gen_tokens"] == ref_p1["gen_tokens"]) and (r["text"] == ref_p1["text"])
@@ -334,26 +511,44 @@ def main():
 
     # 3. Interactive REPL Test (2 consecutive questions + /halt)
     log("\n=== 3. INTERACTIVE BARE-METAL REPL TEST (COM1 SERIAL, 2 TURNS + /halt) ===")
-    repl = test_repl(args.model, smp=16)
+    repl = test_repl(args.model, smp=os_smp)
     repl_ok = (repl["returncode"] == 0 and "Paris" in repl["turn1"] and "56" in repl["turn2"] and "Powering off" in repl["shutdown_msg"])
     log(f"[{'PASS' if repl_ok else 'FAIL'}] REPL exit_code={repl['returncode']}")
     log("--- Turn 1 ---\n" + repl["turn1"].strip())
     log("--- Turn 2 ---\n" + repl["turn2"].strip())
     log("--- Shutdown ---\n" + repl["shutdown_msg"].strip())
 
-    # 4. VGA Screenshot Capture
-    log("\n=== 4. VGA TEXT MODE (0xB8000) SCREENSHOT CAPTURE ===")
-    png_path, size = capture_vga_screenshot(args.model, out_dir, smp=16)
+    # 4. Multi-Turn KV-Cache Memory & /clear Tests (Phase 2 OS + Phase 1 --chat)
+    log("\n=== 4. MULTI-TURN KV-CACHE MEMORY & /clear TESTS (PHASE 2 OS + PHASE 1 --chat) ===")
+    mt_os = test_multiturn_os(args.model, smp=os_smp)
+    log(f"[{'PASS' if mt_os['ok'] else 'FAIL'}] Phase 2 Bare-Metal Multi-Turn (smp={os_smp}, ctx={mt_os['ctx']})")
+    log("--- OS Turn 1 ---\n" + mt_os["turn1"])
+    log("--- OS Turn 2 (Memory Recall) ---\n" + mt_os["turn2"])
+    log("--- OS /clear ---\n" + mt_os["turn3_clear"])
+    log("--- OS Turn 4 (After /clear) ---\n" + mt_os["turn4_after_clear"])
+
+    mt_p1 = test_multiturn_phase1(args.model, threads=os_smp)
+    log(f"[{'PASS' if mt_p1['ok'] else 'FAIL'}] Phase 1 Linux --chat Multi-Turn (threads={os_smp}, ctx={mt_p1['ctx']})")
+    log("--- P1 Turn 1 ---\n" + mt_p1["turn1"])
+    log("--- P1 Turn 2 (Memory Recall) ---\n" + mt_p1["turn2"])
+    log("--- P1 /clear ---\n" + mt_p1["turn3_clear"])
+    log("--- P1 Turn 4 (After /clear) ---\n" + mt_p1["turn4_after_clear"])
+
+    # 5. VGA Screenshot Capture
+    log("\n=== 5. VGA TEXT MODE (0xB8000) SCREENSHOT CAPTURE ===")
+    png_path, size = capture_vga_screenshot(args.model, out_dir, smp=os_smp)
     log(f"[PASS] Saved VGA screenshot: {png_path} ({size[0]}x{size[1]}, {png_path.stat().st_size} bytes)")
 
     log("\n=== SUMMARY ===")
     log(f"Parity vs Phase 1 (5 prompts): {'PASS' if all_parity_ok else 'FAIL'}")
-    log(f"SMP Determinism (1..32 vCPU) : {'PASS' if smp_all_ok else 'FAIL'}")
+    log(f"SMP Determinism (<= {args.max_threads} vCPU) : {'PASS' if smp_all_ok else 'FAIL'}")
     log(f"Interactive REPL (2 turns)   : {'PASS' if repl_ok else 'FAIL'}")
+    log(f"Multi-Turn KV-Cache (OS)     : {'PASS' if mt_os['ok'] else 'FAIL'}")
+    log(f"Multi-Turn KV-Cache (Phase 1): {'PASS' if mt_p1['ok'] else 'FAIL'}")
     log(f"VGA Screenshot               : PASS ({png_path})")
 
     log_path.write_text("\n".join(lines) + "\n")
-    if not (all_parity_ok and smp_all_ok and repl_ok):
+    if not (all_parity_ok and smp_all_ok and repl_ok and mt_os["ok"] and mt_p1["ok"]):
         sys.exit(1)
 
 

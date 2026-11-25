@@ -1,10 +1,10 @@
-# Phase 1: Qwen3-0.6B Inference in a 12 KB Pure x86-64 ELF
+# Phase 1: Qwen3-0.6B Inference in a 13 KB Pure x86-64 ELF
 
 A complete inference engine for **Qwen/Qwen3-0.6B** written in **100% pure x86-64 NASM assembly** for Linux.
 
-- **12,120 bytes** stripped static ELF executable (`.text` = 9,891 B, `.rodata` = 1,625 B).
+- **13,528 bytes** stripped static ELF executable (`.text` = 10,990 B, `.rodata` = 1,943 B).
 - **Zero runtime dependencies:** no `gcc`, no `libc`, no `libm`, no dynamic linker, no `.so` files.
-- **Full Qwen3 architecture:** GQA (`16Q / 8KV`, `head_dim = 128`), per-head QK-Norm (`RMSNorm` on Q and K before RoPE), split-half NeoX RoPE (`rope_theta = 1e6`), SwiGLU MLP, tied embeddings / LM head, KV-cache, greedy and temperature/top-p sampling.
+- **Full Qwen3 architecture:** GQA (`16Q / 8KV`, `head_dim = 128`), per-head QK-Norm (`RMSNorm` on Q and K before RoPE), split-half NeoX RoPE (`rope_theta = 1e6`), SwiGLU MLP, tied embeddings / LM head, persistent multi-turn KV-cache (`--chat`), greedy and temperature/top-p sampling.
 - **Built-in BPE tokenizer in assembly:** Fibonacci-hashed open-addressing merge table (`524,288` slots, 100% token-exact match with HuggingFace `AutoTokenizer`), UTF-8 prompt encoding (English, Cyrillic, code, numbers), Qwen3 chat template (default no-think and `--think` reasoning mode), and raw `write()` streaming to stdout.
 - **AVX2 + FMA Q8_0 x FP32 matmul + zero-libc thread pool:** 4-row unrolled AVX2/FMA kernel, fused QKV and gate+up projections, and a raw Linux `clone()` + `futex()` thread pool with cache-line-isolated completion slots. **105.4 tok/s** peak decode and **154.3 tok/s** peak prefill on AMD EPYC 7642, bit-exact across `1T..47T`.
 
@@ -49,7 +49,7 @@ python3 scripts/export_weights.py \
   --out models/qwen3-0.6b-q8_0.asmbin
 ```
 
-### 3. Build the 12 KB Pure x86-64 Binary
+### 3. Build the 13 KB Pure x86-64 Binary
 
 From the repository root:
 
@@ -61,7 +61,7 @@ make check
 Expected ELF inspection output:
 
 ```text
--rwxr-xr-x 1 user user 12120 build/asm-llm
+-rwxr-xr-x 1 user user 13528 build/asm-llm
 build/asm-llm: ELF 64-bit LSB executable, x86-64, version 1 (SYSV), statically linked, stripped
 There is no dynamic section in this file.
 ```
@@ -72,6 +72,9 @@ There is no dynamic section in this file.
 # Default Qwen3 chat (direct no-think answer, greedy, 16 threads)
 ./build/asm-llm -m models/qwen3-0.6b-q8_0.asmbin \
   -p "Explain how a CPU cache works in 3 concise sentences." -n 128 -t 16
+
+# Interactive multi-turn chat preserving KV-cache across turns (/clear, /think, /nothink, /quit)
+./build/asm-llm -m models/qwen3-0.6b-q8_0.asmbin --chat -t 16
 
 # Enable Qwen3 <think> reasoning mode
 ./build/asm-llm -m models/qwen3-0.6b-q8_0.asmbin \
@@ -98,6 +101,7 @@ There is no dynamic section in this file.
 | `-n <int>` | `128` | Maximum generated tokens |
 | `-t <int>` | `32` | Worker thread count (`clone()` + `futex()` pool) |
 | `-c <int>` | `2048` | KV-cache context length |
+| `--chat` | off | Interactive multi-turn chat via raw Linux `read(0)`/`write(1)` syscalls; preserves KV-cache across turns, supports `/clear` (`/new`, `/reset`), `/think`, `/nothink`, `/quit` (`/exit`, Ctrl-D), and prints `ctx=X/2048` |
 | `--think` | off | Enable Qwen3 `<think>...</think>` reasoning mode |
 | `--raw` | off | Skip Qwen3 chat template, encode prompt bytes directly |
 | `--tokens <csv>` | none | Feed comma-separated token IDs directly |

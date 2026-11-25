@@ -1,9 +1,9 @@
-# Phase 2: Bare-Metal Bootable Qwen3-0.6B OS in 22 KB of Pure Assembly
+# Phase 2: Bare-Metal Bootable Qwen3-0.6B OS in 23 KB of Pure Assembly
 
 A standalone bootable x86-64 operating system that runs **Qwen/Qwen3-0.6B** directly on hardware or KVM with **no Linux, no Windows, no C, no Rust, and no libc**.
 
-- **22,492 bytes** stripped static Multiboot 1 kernel (`build/asm-llm-os.elf`, `.text` = 15,559 B, `.rodata` = 2,548 B, `.bss` = 2.1 MiB `NOBITS`, zero dynamic dependencies).
-- **85 ms cold boot** to interactive `asm-llm>` prompt with all SMP cores online and the 649 MiB model bound zero-copy from physical RAM.
+- **23,132 bytes** stripped static Multiboot 1 kernel (`build/asm-llm-os.elf`, `.text` = 16,119 B, `.rodata` = 2,676 B, `.bss` = 2.1 MiB `NOBITS`, zero dynamic dependencies).
+- **85 ms cold boot** to interactive `asm-llm>` multi-turn chat with persistent KV-cache across turns, all SMP cores online, and the 649 MiB model bound zero-copy from physical RAM.
 - **100% token-exact and byte-for-byte parity** with [Phase 1](../01-qwen3-inference/) across `1..32` vCPUs.
 - **100.1 tok/s** decode on QEMU KVM (AMD EPYC 7642, 32 vCPUs) and **55.4 tok/s** live on a **0 GB disk Proxmox VE VM** (Intel Xeon E5-2670 v3, 12 cores).
 
@@ -42,7 +42,7 @@ make os-check
 Expected output:
 
 ```text
--rwxr-xr-x 1 user user 22492 build/asm-llm-os.elf
+-rwxr-xr-x 1 user user 23132 build/asm-llm-os.elf
 build/asm-llm-os.elf: ELF 32-bit LSB executable, Intel 80386, version 1 (SYSV), statically linked, stripped
 There is no dynamic section in this file.
 ```
@@ -88,7 +88,7 @@ qemu-system-x86_64 -enable-kvm -cpu host -m 2G -smp 16 \
 
 ### Option B: Bootable Hybrid BIOS+UEFI ISO
 
-Packages the 22 KB kernel, GRUB2 Multiboot 1 config, and the 649 MiB `.asmbin` model into a single self-contained `~661 MiB` bootable ISO (`build/asm-llm-os.iso`):
+Packages the 23 KB kernel, GRUB2 Multiboot 1 config, and the 649 MiB `.asmbin` model into a single self-contained `~661 MiB` bootable ISO (`build/asm-llm-os.iso`):
 
 ```bash
 make os-iso MODEL=models/qwen3-0.6b-q8_0.asmbin
@@ -141,17 +141,20 @@ qm terminal 250
 
 ---
 
-## Interactive REPL & Kernel Cmdline
+## Interactive Multi-Turn Chat & Kernel Cmdline
 
 ### Interactive Console (`asm-llm>`)
 
-Both PS/2 keyboard (VGA) and COM1 serial (`115200 8N1`) are polled simultaneously. Type any prompt and press Enter, or use a built-in command:
+By default, the bare-metal console runs in **multi-turn chat mode with persistent KV-cache**: each new user turn prefills only the new Qwen3 chat tokens starting at `g_chat_pos` without recomputing earlier turns, closes every assistant turn in the KV-cache with `<|im_end|>\n`, and displays live context usage (`ctx=X/2048`) in the decode stats line. When the KV-cache approaches `max_seq` (`pos + n_prompt + 64 >= max_seq`), it prints `[chat] context full, resetting KV-cache` and resets cleanly. If booted with `prompt="..."` and `shutdown=0`, the initial batch turn stays in the KV-cache so you can continue the same conversation in the REPL.
+
+Both PS/2 keyboard (VGA) and COM1 serial (`115200 8N1`) are polled simultaneously. Type any message and press Enter, or use a built-in command:
 
 | Command | Action |
 |---|---|
+| `/clear`, `/new`, `/reset` | Clear conversation history (`g_chat_pos = 0`, prints `ctx=0/2048`) |
 | `/think` | Enable Qwen3 `<think>...</think>` reasoning mode |
 | `/nothink` | Disable reasoning mode (direct answers, default) |
-| `/bench` | Run built-in latency/throughput benchmark prompt |
+| `/bench` | Reset KV-cache and run built-in latency/throughput benchmark prompt |
 | `/halt` or `/quit` | Trigger clean ACPI S5 poweroff |
 | `/help` | Show available console commands |
 
@@ -161,12 +164,13 @@ Pass via QEMU `-append "..."`, `make os-run CMDLINE='...'`, or `make os-iso CMDL
 
 | Option | Default | Description |
 |---|---:|---|
-| `prompt="..."` | *(none)* | Run a batch prompt immediately after boot |
+| `prompt="..."` | *(none)* | Run a batch prompt immediately after boot (preserved in KV-cache if `shutdown=0`) |
 | `max_tokens=N` | `128` | Maximum tokens to generate per prompt |
 | `ctx=N` | `2048` | KV-cache context length |
 | `threads=N` | `0` | Limit active SMP cores (`0` = all online cores) |
 | `think=0\|1` | `0` | Enable or disable Qwen3 reasoning mode |
 | `raw=0\|1` | `0` | Skip Qwen3 chat template |
+| `single_turn=0\|1` | `0` | Disable multi-turn KV-cache retention (`0` = multi-turn chat by default) |
 | `temp=F` | `0.0` | Sampling temperature (`0.0` = greedy) |
 | `topp=F` | `0.95` | Top-p threshold |
 | `seed=N` | `42` | PRNG seed |
@@ -177,7 +181,7 @@ Pass via QEMU `-append "..."`, `make os-run CMDLINE='...'`, or `make os-iso CMDL
 
 ## Architecture Overview
 
-Phase 2 compiles the exact same `shared/math.asm`, `shared/matmul.asm`, `shared/tokenizer.asm`, and `shared/transformer.asm` with `-DBARE_METAL` and pairs them with 3,914 lines of bare-metal OS code:
+Phase 2 compiles the exact same `shared/math.asm`, `shared/matmul.asm`, `shared/tokenizer.asm`, and `shared/transformer.asm` with `-DBARE_METAL` and pairs them with 4,058 lines of bare-metal OS code:
 
 - **Boot & Long Mode (`boot.asm`, `linker.ld`):** verifies Multiboot 1 magic (`0x2BADB002`), zeroes `.bss`, builds 4-level 2 MiB huge-page identity tables covering `0..4 GiB` (with `0xFE000000..0xFFFFFFFF` marked Strong Uncacheable for Local APIC MMIO), enters 64-bit Long Mode, installs a 32-entry exception IDT, verifies `XSAVE + AVX + AVX2 + FMA` via CPUID, and initializes `CR0`/`CR4`/`XCR0=7`/`MXCSR`.
 - **Zero-Copy Weights & Physical Arena (`runtime.asm`):** binds the `.asmbin` Multiboot module directly at its physical address (validating `"ASML"` magic) and carves the 449 MiB KV-cache + scratch arena from the largest usable Multiboot memory-map region, zeroing it with AVX2.
