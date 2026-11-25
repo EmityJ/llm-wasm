@@ -41,6 +41,10 @@
 ; --- .asmbin Header Offsets (128 bytes) ---
 %define ASMBIN_MAGIC        0x4C4D5341  ; "ASML"
 %define ASMBIN_VERSION      1
+%define ASMBIN_VERSION_V2   2
+%define HDR_FLAG_TIED_EMB   1
+%define HDR_FLAG_QK_NORM    2
+%define HDR_FLAG_FP16_SCALES 4
 
 %define HDR_MAGIC           0
 %define HDR_VERSION         4
@@ -148,4 +152,6 @@
 %define CTX_BUF_PROMPT      344
 %define CTX_BUF_GEN         352
 %define CTX_BUF_PROBS       360
+%define CTX_FP16_SCALES     368         ; uint32: 0 = v1 fp32 scales, 1 = v2 fp16 scales
+%define CTX_SCALE_SHIFT     372         ; uint32: 3 = fp32 (K>>3), 4 = fp16 (K>>4)
 %define CTX_SIZE            384

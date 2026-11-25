@@ -590,12 +590,64 @@ vec_add_avx2:
 ; ----------------------------------------------------------------------------
 ; uint64 argmax_f32(const float *x, uint64 n)
 ; rdi = x, rsi = n -> rax = index of maximum float (first index on tie)
+; 8-wide AVX2 scan with exact first-index tie-breaking.
 ; ----------------------------------------------------------------------------
 argmax_f32:
+    cmp     rsi, 8
+    jb      .scalar_init
+
+    sub     rsp, 64                     ; 32B vals + 32B idxs
+    vmovups ymm0, [rdi]                 ; best_vals = x[0..7]
+    vmovdqa ymm1, [rel i_iota8]         ; best_idxs = [0..7]
+    vpbroadcastd ymm3, [rel i_eight]    ; step = [8..8]
+    vpaddd  ymm2, ymm1, ymm3            ; cur_idxs = [8..15]
+    mov     rcx, 8
+    mov     rdx, rsi
+    and     rdx, -8                     ; n8 = n & ~7
+.v_lp:
+    cmp     rcx, rdx
+    jae     .v_red
+    vmovups ymm4, [rdi + rcx*4]
+    vcmpps  ymm5, ymm4, ymm0, 14        ; _CMP_GT_OS: strict > preserves first index
+    vblendvps ymm0, ymm0, ymm4, ymm5
+    vblendvps ymm1, ymm1, ymm2, ymm5
+    vpaddd  ymm2, ymm2, ymm3
+    add     rcx, 8
+    jmp     .v_lp
+
+.v_red:
+    vmovups [rsp], ymm0
+    vmovdqu [rsp + 32], ymm1
+    vmovss  xmm0, [rsp]                 ; best_val
+    mov     eax, [rsp + 32]             ; best_idx (zero-extended)
+    mov     r8d, 1
+.red8:
+    cmp     r8d, 8
+    jae     .v_tail
+    vmovss  xmm1, [rsp + r8*4]
+    mov     r9d, [rsp + 32 + r8*4]
+    vucomiss xmm1, xmm0
+    ja      .take8
+    jb      .next8
+    ; Tie: keep smaller index
+    cmp     r9, rax
+    jae     .next8
+.take8:
+    vmovss  xmm0, xmm1, xmm1
+    mov     rax, r9
+.next8:
+    inc     r8d
+    jmp     .red8
+
+.v_tail:
+    add     rsp, 64
+    jmp     .tail_lp
+
+.scalar_init:
     xor     eax, eax                    ; best_idx = 0
     vmovss  xmm0, [rdi]                 ; best_val = x[0]
     mov     rcx, 1
-.lp:
+.tail_lp:
     cmp     rcx, rsi
     jae     .done
     vmovss  xmm1, [rdi + rcx*4]
@@ -605,7 +657,7 @@ argmax_f32:
     mov     rax, rcx
 .next:
     inc     rcx
-    jmp     .lp
+    jmp     .tail_lp
 .done:
     ret
 
@@ -756,6 +808,8 @@ sample_top_p:
 
 section .rodata
 align 32
+i_iota8:     dd 0, 1, 2, 3, 4, 5, 6, 7
+i_eight:     dd 8
 ; Float32 constants
 f_one:       dd 1.0
 f_exp_hi:    dd 88.3762626647949

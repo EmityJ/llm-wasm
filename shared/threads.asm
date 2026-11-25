@@ -18,16 +18,27 @@ default rel
 
 %include "constants.inc"
 
+%ifndef FAST_Q8
+%define FAST_Q8 1
+%endif
+
 %define SPIN_LIMIT  200000
 
 extern sys_mmap_anon
 extern matmul_q8_0_range
+%if FAST_Q8
+extern quantize_x_q8_0
+extern gqa_attn_range
+%endif
 
 section .text
 
 global tp_init
 global tp_shutdown
 global tp_matmul_q8_0
+%if FAST_Q8
+global tp_gqa_attn
+%endif
 
 ; ----------------------------------------------------------------------------
 ; void tp_init(uint64 n_threads)
@@ -144,9 +155,30 @@ tp_init:
     jne     .worker_exit
     mov     r13d, eax                   ; latch new generation
 
-    ; Deterministic 4-row-aligned slice [r0, r1) for tid = r12
+    ; Deterministic balanced row/head slice [r0, r1) for tid = r12
     mov     rcx, [rel tp_M]
     mov     r8, [rel tp_n_threads]
+%if FAST_Q8
+    ; Ceiling-balanced partitioning: r0 = (tid*M + N - 1) / N, r1 = ((tid+1)*M + N - 1) / N
+    ; Guarantees tid=0 always gets work first and 1-row/1-head balance across 1..64T.
+    lea     r9, [r8 - 1]                ; N - 1
+    mov     rax, rcx
+    imul    rax, r12
+    add     rax, r9
+    xor     edx, edx
+    div     r8
+    mov     r14, rax                    ; r0
+
+    lea     rax, [r12 + 1]
+    cmp     rax, r8
+    je      .last_slice
+    imul    rax, rcx
+    add     rax, r9
+    xor     edx, edx
+    div     r8
+    mov     r15, rax                    ; r1
+    jmp     .run_slice
+%else
     mov     r9, rcx
     shr     r9, 2                       ; blocks4 = M / 4
 
@@ -166,6 +198,7 @@ tp_init:
     shl     rax, 2
     mov     r15, rax                    ; r1
     jmp     .run_slice
+%endif
 .last_slice:
     mov     r15, rcx                    ; r1 = M
 
@@ -177,9 +210,20 @@ tp_init:
     mov     rsi, [rel tp_x]
     mov     rdx, [rel tp_out]
     mov     rcx, [rel tp_K]
+%if FAST_Q8
+    test    rcx, rcx
+    jz      .run_attn
+%endif
     mov     r8,  r14                    ; r0
     mov     r9,  r15                    ; r1
     call    matmul_q8_0_range
+    jmp     .job_done
+%if FAST_Q8
+.run_attn:
+    mov     rcx, r14                    ; h0
+    mov     r8,  r15                    ; h1
+    call    gqa_attn_range
+%endif
 
 .job_done:
     ; Lock-free TSO release store to worker's private 64B cache line!
@@ -219,6 +263,22 @@ tp_shutdown:
 ; rdi = W, rsi = x (f32), rdx = out (f32), rcx = M, r8 = K
 ; ----------------------------------------------------------------------------
 tp_matmul_q8_0:
+%if FAST_Q8
+    ; Quantize input vector x[0..K-1] to Q8_0 ONCE for all worker threads
+    push    rdi
+    push    rsi
+    push    rdx
+    push    rcx
+    push    r8
+    mov     rdi, rsi                    ; x
+    mov     rsi, r8                     ; K
+    call    quantize_x_q8_0
+    pop     r8
+    pop     rcx
+    pop     rdx
+    pop     rsi
+    pop     rdi
+%endif
     mov     rax, [rel tp_n_threads]
     cmp     rax, 1
     jle     .single_thread
@@ -252,10 +312,16 @@ tp_matmul_q8_0:
 
 .run_main_slice:
     mov     rax, [rel tp_M]
+%if FAST_Q8
+    lea     rax, [rax + rbx - 1]
+    xor     edx, edx
+    div     rbx                         ; r1 for tid = 0: ceil(M / N)
+%else
     shr     rax, 2                      ; blocks4
     xor     edx, edx
     div     rbx
     shl     rax, 2                      ; r1 for tid = 0
+%endif
     test    rax, rax
     jz      .wait_workers
 
@@ -263,9 +329,20 @@ tp_matmul_q8_0:
     mov     rsi, [rel tp_x]
     mov     rdx, [rel tp_out]
     mov     rcx, [rel tp_K]
+%if FAST_Q8
+    test    rcx, rcx
+    jz      .main_attn
+%endif
     xor     r8d, r8d                    ; r0 = 0
     mov     r9,  rax                    ; r1
     call    matmul_q8_0_range
+    jmp     .wait_workers
+%if FAST_Q8
+.main_attn:
+    xor     ecx, ecx                    ; h0 = 0
+    mov     r8,  rax                    ; h1
+    call    gqa_attn_range
+%endif
 
 .wait_workers:
     ; Wait for each worker tid = 1 .. n_threads-1 to store new_gen in its cache line
@@ -297,6 +374,50 @@ tp_matmul_q8_0:
     mov     rcx, r8                     ; K
     xor     r8d, r8d                    ; r0 = 0
     jmp     matmul_q8_0_range
+
+%if FAST_Q8
+; ----------------------------------------------------------------------------
+; void tp_gqa_attn(uint64 layer_kv_base, uint64 pos, uint64 scale_gqa_packed,
+;                  uint64 n_heads)
+; Dispatches GQA attention across the thread pool (tp_K = 0 signals attn job).
+; ----------------------------------------------------------------------------
+tp_gqa_attn:
+    mov     rax, [rel tp_n_threads]
+    cmp     rax, 1
+    jle     .attn_single
+
+    push    rbx
+    push    r12
+    sub     rsp, 8
+    mov     rbx, rax
+
+    mov     [rel tp_W], rdi
+    mov     [rel tp_x], rsi
+    mov     [rel tp_out], rdx
+    mov     [rel tp_M], rcx
+    mov     qword [rel tp_K], 0         ; K == 0 -> gqa_attn_range job
+
+    mov     r12d, 1
+    lock xadd dword [rel tp_gen], r12d
+    inc     r12d
+
+    cmp     dword [rel tp_waiters], 0
+    je      tp_matmul_q8_0.run_main_slice
+    lea     rdi, [rel tp_gen]
+    mov     esi, FUTEX_WAKE_PRIVATE
+    mov     edx, FUTEX_WAKE_ALL
+    xor     r10d, r10d
+    xor     r8d, r8d
+    xor     r9d, r9d
+    mov     eax, SYS_futex
+    syscall
+    jmp     tp_matmul_q8_0.run_main_slice
+
+.attn_single:
+    mov     r8, rcx                     ; h1 = n_heads
+    xor     ecx, ecx                    ; h0 = 0
+    jmp     gqa_attn_range
+%endif
 
 section .bss
 alignb 64

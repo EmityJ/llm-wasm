@@ -193,8 +193,8 @@ check_cpu_features:
     push    rbx
     mov     eax, 1
     cpuid
-    ; ECX: bit 12 (FMA), bit 26 (XSAVE), bit 28 (AVX)
-    mov     edx, (1 << 12) | (1 << 26) | (1 << 28)
+    ; ECX: bit 12 (FMA), bit 26 (XSAVE), bit 28 (AVX), bit 29 (F16C)
+    mov     edx, (1 << 12) | (1 << 26) | (1 << 28) | (1 << 29)
     and     ecx, edx
     cmp     ecx, edx
     jne     .no

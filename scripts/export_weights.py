@@ -5,9 +5,11 @@ Export Qwen3-0.6B (BF16 safetensors + tokenizer.json) into a compact,
 
 Weight format: Per-row split Q8_0 (block size = 32, symmetric int8 in [-127, 127]):
   Each row of K elements (K multiple of 32) is stored as:
-    [K bytes of int8 quantized weights] [K/32 * 4 bytes of fp32 block scales]
-  For Qwen3-0.6B (K in {1024, 2048, 3072}), every row stride is an exact
-  multiple of 64 bytes (1152, 2304, 3456), ensuring 32-byte aligned AVX2 loads.
+    - v2 (--scale-dtype fp16, default): [K int8 weights][K/32 * 2B fp16 scales]
+      For Qwen3-0.6B (K in {1024, 2048, 3072}), row strides are {1088, 2176, 3264} B.
+    - v1 (--scale-dtype fp32):          [K int8 weights][K/32 * 4B fp32 scales]
+      For Qwen3-0.6B (K in {1024, 2048, 3072}), row strides are {1152, 2304, 3456} B.
+  Every row stride is an exact multiple of 64 bytes, ensuring 32-byte aligned AVX2 loads.
 """
 
 import argparse
@@ -18,7 +20,11 @@ import time
 import numpy as np
 
 MAGIC = b"ASML"
-VERSION = 1
+VERSION_V1 = 1
+VERSION_V2 = 2
+FLAG_TIED_EMB = 1
+FLAG_QK_NORM = 2
+FLAG_FP16_SCALES = 4
 HEADER_SIZE = 128
 TOK_HEADER_SIZE = 64
 HT_BITS = 19
@@ -82,7 +88,7 @@ def read_tensor_f32(f, hdr, data_offset: int, name: str) -> np.ndarray:
         raise ValueError(f"Unsupported dtype {dtype} for tensor {name}")
 
 
-def quantize_matrix_q8_0_row_split(w: np.ndarray) -> bytes:
+def quantize_matrix_q8_0_row_split(w: np.ndarray, scale_dtype: str = "fp16") -> bytes:
     """Quantize [M, K] float32 matrix into per-row split Q8_0 bytes."""
     assert w.ndim == 2
     M, K = w.shape
@@ -90,14 +96,25 @@ def quantize_matrix_q8_0_row_split(w: np.ndarray) -> bytes:
     nb = K // 32
     blocks = w.reshape(M, nb, 32).astype(np.float32, copy=False)
     amax = np.max(np.abs(blocks), axis=2)  # [M, nb]
-    scale = np.where(amax > 0.0, amax / np.float32(127.0), np.float32(0.0)).astype(np.float32)
-    inv_scale = np.where(scale > 0.0, np.float32(1.0) / scale, np.float32(0.0)).astype(np.float32)
-    q = np.clip(np.rint(blocks * inv_scale[:, :, None]), -127, 127).astype(np.int8)
+    scale_f32 = np.where(amax > 0.0, amax / np.float32(127.0), np.float32(0.0)).astype(np.float32)
+    if scale_dtype == "fp16":
+        scale_f16 = scale_f32.astype(np.float16)
+        scale_eff = scale_f16.astype(np.float32)
+        inv_scale = np.where(scale_eff > 0.0, np.float32(1.0) / scale_eff, np.float32(0.0)).astype(np.float32)
+        q = np.clip(np.rint(blocks * inv_scale[:, :, None]), -127, 127).astype(np.int8)
+        s_bytes = scale_f16.astype("<f2").view(np.uint8).reshape(M, nb * 2)
+        scale_bytes_per_block = 2
+    elif scale_dtype == "fp32":
+        inv_scale = np.where(scale_f32 > 0.0, np.float32(1.0) / scale_f32, np.float32(0.0)).astype(np.float32)
+        q = np.clip(np.rint(blocks * inv_scale[:, :, None]), -127, 127).astype(np.int8)
+        s_bytes = scale_f32.astype("<f4").view(np.uint8).reshape(M, nb * 4)
+        scale_bytes_per_block = 4
+    else:
+        raise ValueError(f"Unsupported scale_dtype: {scale_dtype}")
     q_flat = q.reshape(M, K)  # [M, K] int8
-    s_bytes = scale.view(np.uint8).reshape(M, nb * 4)  # [M, nb*4] uint8
-    # Pack each row contiguously: [K int8][nb*4 scale bytes]
+    # Pack each row contiguously: [K int8][nb*scale_bytes_per_block scale bytes]
     row_packed = np.concatenate([q_flat.view(np.uint8), s_bytes], axis=1)
-    assert row_packed.shape == (M, K + nb * 4)
+    assert row_packed.shape == (M, K + nb * scale_bytes_per_block)
     return row_packed.tobytes()
 
 
@@ -203,8 +220,10 @@ def build_tokenizer_blob(tok_json_path: str, vocab_size: int) -> bytes:
     return bytes(buf)
 
 
-def export_model(model_dir: str, out_path: str, max_seq_len: int = 4096):
+def export_model(model_dir: str, out_path: str, max_seq_len: int = 4096, scale_dtype: str = "fp16"):
     t0 = time.time()
+    use_fp16 = scale_dtype == "fp16"
+    version = VERSION_V2 if use_fp16 else VERSION_V1
     with open(os.path.join(model_dir, "config.json"), "r") as f:
         cfg = json.load(f)
 
@@ -244,8 +263,8 @@ def export_model(model_dir: str, out_path: str, max_seq_len: int = 4096):
             assert max_diff == 0.0, f"tie_word_embeddings=True but diff={max_diff}"
             print("Verified embed_tokens == lm_head exact (max_diff=0.0)")
             del lmh
-        print(f"Quantizing embed_tokens {emb.shape} -> Q8_0...")
-        out.write(quantize_matrix_q8_0_row_split(emb))
+        print(f"Quantizing embed_tokens {emb.shape} -> Q8_0 (scale_dtype={scale_dtype}, v{version})...")
+        out.write(quantize_matrix_q8_0_row_split(emb, scale_dtype=scale_dtype))
         del emb
 
         # 3. Transformer layers (fixed 64-byte aligned stride)
@@ -285,7 +304,7 @@ def export_model(model_dir: str, out_path: str, max_seq_len: int = 4096):
                 pad64(out)
                 mat = read_tensor_f32(sf, hdr, data_offset, name)
                 assert mat.shape == expected_shape, f"{name}: got {mat.shape}, expected {expected_shape}"
-                out.write(quantize_matrix_q8_0_row_split(mat))
+                out.write(quantize_matrix_q8_0_row_split(mat, scale_dtype=scale_dtype))
 
             layer_end = pad64(out)
             this_stride = layer_end - layer_start
@@ -305,13 +324,13 @@ def export_model(model_dir: str, out_path: str, max_seq_len: int = 4096):
         file_size = pad64(out)
 
         # Write 128-byte header
-        flags = (1 if tie_emb else 0) | 2  # bit0=tied_emb, bit1=qk_norm
+        flags = (FLAG_TIED_EMB if tie_emb else 0) | FLAG_QK_NORM | (FLAG_FP16_SCALES if use_fp16 else 0)
         eos_1 = 151645  # <|im_end|>
         eos_2 = 151643  # <|endoftext|>
         header = struct.pack(
             "<4sIIIIIIIIIffIIIIQQQQQQ16s",
             MAGIC,
-            VERSION,
+            version,
             dim,
             hidden_dim,
             n_layers,
@@ -340,6 +359,7 @@ def export_model(model_dir: str, out_path: str, max_seq_len: int = 4096):
 
     dt = time.time() - t0
     print(f"\nExport complete: {out_path}")
+    print(f"  Format       : .asmbin v{version} (scale_dtype={scale_dtype}, flags=0x{flags:x})")
     print(f"  Total size   : {file_size:,} bytes ({file_size / (1024**2):.2f} MiB)")
     print(f"  off_tokenizer: {off_tokenizer:,}")
     print(f"  off_embed    : {off_embed:,}")
@@ -353,8 +373,9 @@ def main():
     ap.add_argument("--model-dir", default="models/qwen3-0.6b-bf16", help="Directory containing Qwen3-0.6B config.json, model.safetensors, tokenizer.json")
     ap.add_argument("--out", default="models/qwen3-0.6b-q8_0.asmbin", help="Output .asmbin path")
     ap.add_argument("--max-seq-len", type=int, default=4096)
+    ap.add_argument("--scale-dtype", choices=["fp16", "fp32"], default="fp16", help="Per-block Q8_0 scale dtype (fp16 -> v2 compact, fp32 -> v1 legacy)")
     args = ap.parse_args()
-    export_model(args.model_dir, args.out, args.max_seq_len)
+    export_model(args.model_dir, args.out, args.max_seq_len, scale_dtype=args.scale_dtype)
 
 
 if __name__ == "__main__":

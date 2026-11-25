@@ -14,6 +14,10 @@ default rel
 
 %include "constants.inc"
 
+%ifndef FAST_Q8
+%define FAST_Q8 1
+%endif
+
 %ifndef BARE_METAL
 extern sys_openat_ro
 extern sys_close
@@ -31,11 +35,15 @@ extern softmax_avx2
 extern silu_mul_avx2
 extern vec_add_avx2
 
+extern matmul_set_fp16
 extern dequant_row_q8_0
 extern dot_f32_avx2
 extern saxpy_f32_avx2
 
 extern tp_matmul_q8_0
+%if FAST_Q8
+extern tp_gqa_attn
+%endif
 
 section .text
 
@@ -43,6 +51,9 @@ global g_ctx
 global model_init
 global model_free
 global transformer_forward
+%if FAST_Q8
+global gqa_attn_range
+%endif
 
 ; Helper macro: align reg up to 64 bytes
 %macro ALIGN64 1
@@ -100,11 +111,28 @@ model_init:
     js      .err_mmap
 %endif
 
-    ; Verify header magic and version
+    ; Verify header magic and version (v1 fp32 scales or v2 fp16 scales)
     cmp     dword [r15 + HDR_MAGIC], ASMBIN_MAGIC
     jne     .err_bad_hdr
-    cmp     dword [r15 + HDR_VERSION], ASMBIN_VERSION
+    mov     eax, [r15 + HDR_VERSION]
+    cmp     eax, ASMBIN_VERSION
+    je      .ver_ok
+    cmp     eax, ASMBIN_VERSION_V2
     jne     .err_bad_hdr
+.ver_ok:
+    xor     ecx, ecx
+    test    dword [r15 + HDR_FLAGS], HDR_FLAG_FP16_SCALES
+    setnz   cl
+    cmp     eax, ASMBIN_VERSION_V2
+    jb      .store_scale_mode
+    mov     ecx, 1
+.store_scale_mode:
+    mov     [rbx + CTX_FP16_SCALES], ecx
+    mov     edx, 3
+    add     edx, ecx                    ; 3 for fp32 (K>>3), 4 for fp16 (K>>4)
+    mov     [rbx + CTX_SCALE_SHIFT], edx
+    mov     edi, ecx
+    call    matmul_set_fp16
 
     mov     [rbx + CTX_MMAP_BASE], r15
     mov     [rbx + CTX_MMAP_SIZE], r14
@@ -209,8 +237,9 @@ model_init:
     shl     rax, 2                      ; q_dim * 4
     ALLOC_BUF CTX_BUF_ATT_OUT, rax
 
-    mov     rax, [rbx + CTX_MAX_SEQ]
-    shl     rax, 2                      ; max_seq * 4
+    mov     rax, [rbx + CTX_N_HEADS]
+    imul    rax, [rbx + CTX_MAX_SEQ]
+    shl     rax, 2                      ; n_heads * max_seq * 4 (private per-head scores)
     ALLOC_BUF CTX_BUF_ATT_SCR, rax
 
     ; Place buf_gate and buf_up CONTIGUOUSLY so gate+up execute in ONE fused matmul!
@@ -388,10 +417,11 @@ transformer_forward:
 
     ; 1. Embedding lookup: dequantize row token_id of embed_tokens into buf_x
     mov     rax, [rbx + CTX_DIM]
-    mov     rcx, rax
-    shr     rcx, 3
-    add     rcx, rax                    ; emb_row_stride = dim + dim/8
-    imul    rdi, rcx
+    mov     ecx, [rbx + CTX_SCALE_SHIFT]
+    mov     rdx, rax
+    shr     rdx, cl
+    add     rdx, rax                    ; emb_row_stride = dim + (dim >> scale_shift)
+    imul    rdi, rdx
     add     rdi, [rbx + CTX_EMB_PTR]
     mov     rsi, [rbx + CTX_BUF_X]
     mov     rdx, rax                    ; dim
@@ -433,12 +463,12 @@ transformer_forward:
     shl     rcx, 2
     add     rax, rcx
 
-    ; Helper: row_stride(K) = K + K/8
-    ; dim_stride = dim + dim/8
+    ; Helper: row_stride(K) = K + (K >> scale_shift) [3 for v1 fp32, 4 for v2 fp16]
+    mov     ecx, [rbx + CTX_SCALE_SHIFT]
     mov     r12, [rbx + CTX_DIM]
     mov     r13, r12
-    shr     r13, 3
-    add     r12, r13                    ; r12 = dim_stride (1152)
+    shr     r13, cl
+    add     r12, r13                    ; r12 = dim_stride (1152 v1 / 1088 v2)
 
     ALIGN64 rax
     mov     [rsp + 56], rax             ; q_proj [q_dim, dim]
@@ -458,12 +488,13 @@ transformer_forward:
 
     ALIGN64 rax
     mov     [rsp + 80], rax             ; o_proj [dim, q_dim]
-    mov     rcx, [rbx + CTX_Q_DIM]
-    mov     rdx, rcx
-    shr     rdx, 3
-    add     rcx, rdx                    ; q_dim_stride (2304)
-    imul    rcx, [rbx + CTX_DIM]
-    add     rax, rcx
+    mov     ecx, [rbx + CTX_SCALE_SHIFT]
+    mov     r13, [rbx + CTX_Q_DIM]
+    mov     rdx, r13
+    shr     rdx, cl
+    add     r13, rdx                    ; q_dim_stride (2304 v1 / 2176 v2)
+    imul    r13, [rbx + CTX_DIM]
+    add     rax, r13
 
     ALIGN64 rax
     mov     [rsp + 88], rax             ; gate_proj [hidden_dim, dim]
@@ -540,7 +571,7 @@ transformer_forward:
     mov     r8,  [rbx + CTX_HEAD_DIM]
     call    rope_apply_avx2
 
-    ; --- 3e. Store K, V at cache[l, pos] ---
+    ; --- 3e. Store K, V at contiguous cache[l, kv_h, pos, head_dim] ---
     ; layer_kv_base_bytes = l * max_seq * kv_dim * 4
     mov     rax, [rsp + 16]             ; l
     imul    rax, [rbx + CTX_MAX_SEQ]
@@ -548,7 +579,54 @@ transformer_forward:
     shl     rax, 2
     mov     [rsp + 120], rax
 
-    ; pos_offset = pos * kv_dim * 4
+%if FAST_Q8
+    ; Head-major contiguous KV layout: cache[l, kv_h, pos, head_dim]
+    ; Eliminates 4KB L1D set aliasing & TLB thrashing across timesteps!
+    mov     r14, [rbx + CTX_HEAD_DIM]
+    shl     r14, 2                      ; head_bytes (512)
+    mov     r15, [rbx + CTX_MAX_SEQ]
+    imul    r15, r14                    ; kv_head_stride = max_seq * head_bytes
+    mov     rcx, [rsp + 0]              ; pos
+    imul    rcx, r14                    ; pos_off = pos * head_bytes
+    add     rax, rcx                    ; layer_kv_base + pos_off
+
+    mov     rdi, [rbx + CTX_BUF_K_CACHE]
+    add     rdi, rax
+    mov     rdx, [rbx + CTX_BUF_V_CACHE]
+    add     rdx, rax
+    mov     rsi, [rbx + CTX_BUF_K]
+    mov     r8,  [rbx + CTX_BUF_V]
+    mov     r12, [rbx + CTX_N_KV_HEADS]
+.kv_head_lp:
+    xor     r9d, r9d
+.kv_copy_lp:
+    cmp     r9, r14
+    jae     .kv_head_next
+    vmovups ymm0, [rsi + r9]
+    vmovups ymm1, [r8 + r9]
+    vmovups [rdi + r9], ymm0
+    vmovups [rdx + r9], ymm1
+    add     r9, 32
+    jmp     .kv_copy_lp
+.kv_head_next:
+    add     rsi, r14
+    add     r8,  r14
+    add     rdi, r15
+    add     rdx, r15
+    dec     r12
+    jnz     .kv_head_lp
+
+    ; --- 3f. Parallel GQA Attention over heads h = 0 .. n_heads - 1 ---
+    mov     rdi, [rsp + 120]            ; layer_kv_base
+    mov     rsi, [rsp + 0]              ; pos
+    mov     edx, [rsp + 116]            ; gqa_ratio (upper 32 bits)
+    shl     rdx, 32
+    mov     eax, [rsp + 112]            ; att_scale float32 bits (lower 32 bits)
+    or      rdx, rax
+    mov     rcx, [rbx + CTX_N_HEADS]
+    call    tp_gqa_attn
+%else
+    ; Legacy layout: cache[l, pos, kv_h, head_dim]
     mov     rcx, [rsp + 0]              ; pos
     imul    rcx, [rbx + CTX_KV_DIM]
     shl     rcx, 2
@@ -672,6 +750,7 @@ transformer_forward:
 .head_next:
     inc     r12
     jmp     .head_lp
+%endif
 
 .att_done:
     ; --- 3g. Output projection + residual: buf_x += o_proj @ buf_att_out ---
@@ -754,6 +833,148 @@ transformer_forward:
     pop     rbp
     pop     rbx
     ret
+
+%if FAST_Q8
+; ----------------------------------------------------------------------------
+; void gqa_attn_range(uint64 layer_kv_base, uint64 pos, uint64 scale_gqa_packed,
+;                     uint64 h0, uint64 h1)
+; rdi = layer_kv_base, rsi = pos, rdx = (gqa_ratio << 32) | att_scale_bits,
+; rcx = h0, r8 = h1
+; Thread-safe parallel GQA attention over contiguous cache[l, kv_h, pos, hd].
+; ----------------------------------------------------------------------------
+gqa_attn_range:
+    push    rbx
+    push    rbp
+    push    r12
+    push    r13
+    push    r14
+    push    r15
+    sub     rsp, 40                     ; 6 pushes(48) + 40 + ret(8) = 96 (16B aligned)
+    ; [rsp + 0]  = layer_kv_base
+    ; [rsp + 8]  = pos
+    ; [rsp + 16] = att_scale (f32)
+    ; [rsp + 20] = gqa_ratio (u32)
+    ; [rsp + 24] = h1
+    ; [rsp + 32] = kv_head_stride (max_seq * head_dim * 4)
+
+    mov     [rsp + 0], rdi
+    mov     [rsp + 8], rsi
+    mov     [rsp + 16], edx             ; att_scale bits
+    shr     rdx, 32
+    mov     [rsp + 20], edx             ; gqa_ratio
+    mov     [rsp + 24], r8              ; h1
+
+    lea     rbx, [rel g_ctx]
+    mov     rbp, [rbx + CTX_HEAD_DIM]
+    shl     rbp, 2                      ; rbp = head_bytes (step per t = 512B contiguous!)
+    mov     rax, [rbx + CTX_MAX_SEQ]
+    imul    rax, rbp
+    mov     [rsp + 32], rax             ; kv_head_stride
+
+    mov     r12, rcx                    ; h = h0
+.h_lp:
+    cmp     r12, [rsp + 24]
+    jae     .h_done
+
+    ; kv_h = h / gqa_ratio; r13 = layer_kv_base + kv_h * kv_head_stride
+    mov     eax, r12d
+    xor     edx, edx
+    div     dword [rsp + 20]
+    imul    rax, [rsp + 32]
+    add     rax, [rsp + 0]
+    mov     r13, rax
+
+    ; q_head = buf_q + h * head_bytes
+    mov     rax, r12
+    imul    rax, rbp
+    mov     r14, [rbx + CTX_BUF_Q]
+    add     r14, rax
+
+    ; Private score buffer scr_h = buf_att_scr + h * max_seq * 4
+    mov     r11, r12
+    imul    r11, [rbx + CTX_MAX_SEQ]
+    shl     r11, 2
+    add     r11, [rbx + CTX_BUF_ATT_SCR]
+
+    ; Scores[0..pos]: dot(q_head, k_cache[l, kv_h, t]) * att_scale
+    mov     r15, [rbx + CTX_BUF_K_CACHE]
+    add     r15, r13
+    xor     ecx, ecx
+.sc_lp:
+    cmp     rcx, [rsp + 8]
+    ja      .sc_done
+    push    rcx
+    push    r11
+    mov     rdi, r14
+    mov     rsi, r15
+    mov     rdx, [rbx + CTX_HEAD_DIM]
+    call    dot_f32_avx2
+    pop     r11
+    pop     rcx
+    vmulss  xmm0, xmm0, [rsp + 16]
+    vmovss  [r11 + rcx*4], xmm0
+    add     r15, rbp                    ; contiguous +512B!
+    inc     rcx
+    jmp     .sc_lp
+
+.sc_done:
+    push    r11
+    sub     rsp, 8                      ; 16B align
+    mov     rdi, r11
+    mov     rsi, [rsp + 24]             ; pos (rsp+8 + 16 = rsp+24)
+    inc     rsi
+    call    softmax_avx2
+    add     rsp, 8
+    pop     r11
+
+    ; Zero att_head = buf_att_out + h * head_bytes
+    mov     rax, r12
+    imul    rax, rbp
+    mov     r14, [rbx + CTX_BUF_ATT_OUT]
+    add     r14, rax
+    vxorps  ymm0, ymm0, ymm0
+    xor     eax, eax
+.z_lp:
+    cmp     rax, rbp
+    jae     .v_acc
+    vmovups [r14 + rax], ymm0
+    add     rax, 32
+    jmp     .z_lp
+
+.v_acc:
+    mov     r15, [rbx + CTX_BUF_V_CACHE]
+    add     r15, r13
+    xor     ecx, ecx
+.v_lp:
+    cmp     rcx, [rsp + 8]
+    ja      .h_next
+    vmovss  xmm0, [r11 + rcx*4]
+    push    rcx
+    push    r11
+    mov     rdi, r14
+    mov     rsi, r15
+    mov     rdx, [rbx + CTX_HEAD_DIM]
+    call    saxpy_f32_avx2
+    pop     r11
+    pop     rcx
+    add     r15, rbp                    ; contiguous +512B!
+    inc     rcx
+    jmp     .v_lp
+
+.h_next:
+    inc     r12
+    jmp     .h_lp
+
+.h_done:
+    add     rsp, 40
+    pop     r15
+    pop     r14
+    pop     r13
+    pop     r12
+    pop     rbp
+    pop     rbx
+    ret
+%endif
 
 section .rodata
 align 4

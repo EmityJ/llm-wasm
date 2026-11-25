@@ -7,9 +7,10 @@
 ; to stdout:
 ;   stdin : [64 floats for exp] [64 floats for sincos] [128 floats x + 128 floats w for rmsnorm]
 ;           [64 floats gate + 64 floats up for silu_mul]
-;           [64 floats x_vec + 8x64 Q8_0 rows (8*72=576 bytes) for matmul]
+;           [64 floats x_vec + 8x64 Q8_0 v1 fp32-scale rows (8*72=576B)
+;            + 8x64 Q8_0 v2 fp16-scale rows (8*68=544B)]
 ;   stdout: [64 exp_out] [64 sin_out] [64 cos_out] [64 rope_inv_freq f64 (512B)]
-;           [128 rmsnorm_out] [64 silu_out] [8 matmul_out]
+;           [128 rmsnorm_out] [64 silu_out] [8 matmul_v1_out] [8 matmul_v2_out]
 ; ============================================================================
 
 bits 64
@@ -17,7 +18,11 @@ default rel
 
 %include "constants.inc"
 
-%define IN_TOTAL_BYTES (2304 + 576)
+%ifndef FAST_Q8
+%define FAST_Q8 1
+%endif
+
+%define IN_TOTAL_BYTES (2304 + 576 + 544)
 
 extern sys_write_all
 extern sys_exit_group
@@ -26,6 +31,10 @@ extern fast_sincosf
 extern init_rope_freqs
 extern rmsnorm_avx2
 extern silu_mul_avx2
+extern matmul_set_fp16
+%if FAST_Q8
+extern quantize_x_q8_0
+%endif
 extern matmul_q8_0_range
 
 section .text
@@ -115,10 +124,27 @@ _start:
     mov     rdx, 64
     call    silu_mul_avx2
 
-    ; 6. matmul_q8_0_range Q8_0 x F32 (8 rows x 64 cols)
+    ; 6. matmul_q8_0_range (8 rows x 64 cols): v1 fp32 scales + v2 fp16 scales
+%if FAST_Q8
+    lea     rdi, [rel in_mm_x]
+    mov     rsi, 64
+    call    quantize_x_q8_0
+%endif
+    xor     edi, edi
+    call    matmul_set_fp16
     lea     rdi, [rel in_mm_w]
     lea     rsi, [rel in_mm_x]
     lea     rdx, [rel out_mm]
+    mov     rcx, 64             ; K
+    xor     r8d, r8d            ; r0 = 0
+    mov     r9,  8              ; r1 = 8
+    call    matmul_q8_0_range
+
+    mov     edi, 1
+    call    matmul_set_fp16
+    lea     rdi, [rel in_mm_w16]
+    lea     rsi, [rel in_mm_x]
+    lea     rdx, [rel out_mm16]
     mov     rcx, 64             ; K
     xor     r8d, r8d            ; r0 = 0
     mov     r9,  8              ; r1 = 8
@@ -157,7 +183,12 @@ _start:
 
     mov     edi, 1
     lea     rsi, [rel out_mm]
-    mov     edx, 32             ; 8 f32
+    mov     edx, 32             ; 8 f32 (v1 fp32 scales)
+    call    sys_write_all
+
+    mov     edi, 1
+    lea     rsi, [rel out_mm16]
+    mov     edx, 32             ; 8 f32 (v2 fp16 scales)
     call    sys_write_all
 
     xor     edi, edi
@@ -178,7 +209,8 @@ in_rms_w: resb 512              ; 128 f32
 in_gate:  resb 256              ; 64 f32
 in_up:    resb 256              ; 64 f32
 in_mm_x:  resb 256              ; 64 f32
-in_mm_w:  resb 576
+in_mm_w:  resb 576              ; 8 * (64 + 8) v1 fp32 scales
+in_mm_w16: resb 544             ; 8 * (64 + 4) v2 fp16 scales
 
 alignb 64
 out_exp:  resb 256
@@ -187,3 +219,4 @@ out_cos:  resb 256
 out_rope: resb 512
 out_rms:  resb 512
 out_mm:   resb 32
+out_mm16: resb 32

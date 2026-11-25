@@ -13,6 +13,10 @@ default rel
 %include "constants.inc"
 %include "os_constants.inc"
 
+%ifndef FAST_Q8
+%define FAST_Q8 1
+%endif
+
 extern pml4_table
 extern gdt64_ptr
 extern idt64_ptr
@@ -20,12 +24,19 @@ extern enable_avx_fpu
 extern pit_delay_us
 extern timer_ns
 extern matmul_q8_0_range
+%if FAST_Q8
+extern quantize_x_q8_0
+extern gqa_attn_range
+%endif
 
 section .text
 
 global smp_init
 global tp_shutdown
 global tp_matmul_q8_0
+%if FAST_Q8
+global tp_gqa_attn
+%endif
 global g_smp_total_cpus
 global g_smp_online_cpus
 global g_smp_apic_base
@@ -551,8 +562,27 @@ ap_entry64:
     cmp     r12, r8
     jae     .job_done
 
-    ; Deterministic 4-row-aligned slice [r0, r1) for tid = r12
+    ; Deterministic balanced row/head slice [r0, r1) for tid = r12
     mov     rcx, [rel tp_M]
+%if FAST_Q8
+    lea     r9, [r8 - 1]                ; N - 1
+    mov     rax, rcx
+    imul    rax, r12
+    add     rax, r9
+    xor     edx, edx
+    div     r8
+    mov     r14, rax                    ; r0
+
+    lea     rax, [r12 + 1]
+    cmp     rax, r8
+    je      .last_slice
+    imul    rax, rcx
+    add     rax, r9
+    xor     edx, edx
+    div     r8
+    mov     r15, rax                    ; r1
+    jmp     .run_slice
+%else
     mov     r9, rcx
     shr     r9, 2                       ; blocks4 = M / 4
 
@@ -572,6 +602,7 @@ ap_entry64:
     shl     rax, 2
     mov     r15, rax                    ; r1
     jmp     .run_slice
+%endif
 .last_slice:
     mov     r15, rcx                    ; r1 = M
 
@@ -583,9 +614,20 @@ ap_entry64:
     mov     rsi, [rel tp_x]
     mov     rdx, [rel tp_out]
     mov     rcx, [rel tp_K]
+%if FAST_Q8
+    test    rcx, rcx
+    jz      .run_attn
+%endif
     mov     r8,  r14                    ; r0
     mov     r9,  r15                    ; r1
     call    matmul_q8_0_range
+    jmp     .job_done
+%if FAST_Q8
+.run_attn:
+    mov     rcx, r14                    ; h0
+    mov     r8,  r15                    ; h1
+    call    gqa_attn_range
+%endif
 
 .job_done:
     ; Lock-free TSO release store to this core's private 64B cache line
@@ -616,6 +658,22 @@ tp_shutdown:
 ; Exact same ABI and 4-row-aligned partitioning as Phase 1 src/threads.asm!
 ; ----------------------------------------------------------------------------
 tp_matmul_q8_0:
+%if FAST_Q8
+    ; Quantize input vector x[0..K-1] to Q8_0 ONCE before waking AP cores
+    push    rdi
+    push    rsi
+    push    rdx
+    push    rcx
+    push    r8
+    mov     rdi, rsi                    ; x
+    mov     rsi, r8                     ; K
+    call    quantize_x_q8_0
+    pop     r8
+    pop     rcx
+    pop     rdx
+    pop     rsi
+    pop     rdi
+%endif
     mov     rax, [rel tp_n_threads]
     cmp     rax, 1
     jle     .single_thread
@@ -636,12 +694,19 @@ tp_matmul_q8_0:
     lock xadd dword [rel tp_gen], r12d
     inc     r12d                        ; r12d = new_gen
 
+.run_bsp_slice:
     ; Run BSP's own slice (tid = 0)
     mov     rax, [rel tp_M]
+%if FAST_Q8
+    lea     rax, [rax + rbx - 1]
+    xor     edx, edx
+    div     rbx                         ; r1 for tid = 0: ceil(M / N)
+%else
     shr     rax, 2                      ; blocks4
     xor     edx, edx
     div     rbx
     shl     rax, 2                      ; r1 for tid = 0
+%endif
     test    rax, rax
     jz      .wait_workers
 
@@ -649,9 +714,20 @@ tp_matmul_q8_0:
     mov     rsi, [rel tp_x]
     mov     rdx, [rel tp_out]
     mov     rcx, [rel tp_K]
+%if FAST_Q8
+    test    rcx, rcx
+    jz      .bsp_attn
+%endif
     xor     r8d, r8d                    ; r0 = 0
     mov     r9,  rax                    ; r1
     call    matmul_q8_0_range
+    jmp     .wait_workers
+%if FAST_Q8
+.bsp_attn:
+    xor     ecx, ecx                    ; h0 = 0
+    mov     r8,  rax                    ; h1
+    call    gqa_attn_range
+%endif
 
 .wait_workers:
     ; Spin-wait for each worker tid = 1 .. n_threads - 1
@@ -683,6 +759,39 @@ tp_matmul_q8_0:
     mov     rcx, r8                     ; K
     xor     r8d, r8d                    ; r0 = 0
     jmp     matmul_q8_0_range
+
+%if FAST_Q8
+; ----------------------------------------------------------------------------
+; void tp_gqa_attn(uint64 layer_kv_base, uint64 pos, uint64 scale_gqa_packed,
+;                  uint64 n_heads)
+; Dispatches GQA attention across SMP AP cores (tp_K = 0 signals attn job).
+; ----------------------------------------------------------------------------
+tp_gqa_attn:
+    mov     rax, [rel tp_n_threads]
+    cmp     rax, 1
+    jle     .attn_single
+
+    push    rbx
+    push    r12
+    sub     rsp, 8
+    mov     rbx, rax
+
+    mov     [rel tp_W], rdi
+    mov     [rel tp_x], rsi
+    mov     [rel tp_out], rdx
+    mov     [rel tp_M], rcx
+    mov     qword [rel tp_K], 0
+
+    mov     r12d, 1
+    lock xadd dword [rel tp_gen], r12d
+    inc     r12d
+    jmp     tp_matmul_q8_0.run_bsp_slice
+
+.attn_single:
+    mov     r8, rcx                     ; h1 = n_heads
+    xor     ecx, ecx                    ; h0 = 0
+    jmp     gqa_attn_range
+%endif
 
 ; ============================================================================
 ; Position-Independent 16-bit -> 32-bit -> 64-bit AP Trampoline (copied to 0x8000)

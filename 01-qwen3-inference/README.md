@@ -1,18 +1,18 @@
-# Phase 1: Qwen3-0.6B Inference in a 13 KB Pure x86-64 ELF
+# Phase 1: Qwen3-0.6B Inference in a 14 KB Pure x86-64 ELF
 
 A complete inference engine for **Qwen/Qwen3-0.6B** written in **100% pure x86-64 NASM assembly** for Linux.
 
-- **13,528 bytes** stripped static ELF executable (`.text` = 10,990 B, `.rodata` = 1,943 B).
+- **14,712 bytes** stripped static ELF executable (`FAST_Q8=1`, default) or **14,008 bytes** (`FAST_Q8=0`, legacy FP32-activation mode).
 - **Zero runtime dependencies:** no `gcc`, no `libc`, no `libm`, no dynamic linker, no `.so` files.
 - **Full Qwen3 architecture:** GQA (`16Q / 8KV`, `head_dim = 128`), per-head QK-Norm (`RMSNorm` on Q and K before RoPE), split-half NeoX RoPE (`rope_theta = 1e6`), SwiGLU MLP, tied embeddings / LM head, persistent multi-turn KV-cache (`--chat`), greedy and temperature/top-p sampling.
 - **Built-in BPE tokenizer in assembly:** Fibonacci-hashed open-addressing merge table (`524,288` slots, 100% token-exact match with HuggingFace `AutoTokenizer`), UTF-8 prompt encoding (English, Cyrillic, code, numbers), Qwen3 chat template (default no-think and `--think` reasoning mode), and raw `write()` streaming to stdout.
-- **AVX2 + FMA Q8_0 x FP32 matmul + zero-libc thread pool:** 4-row unrolled AVX2/FMA kernel, fused QKV and gate+up projections, and a raw Linux `clone()` + `futex()` thread pool with cache-line-isolated completion slots. **105.4 tok/s** peak decode and **154.3 tok/s** peak prefill on AMD EPYC 7642, bit-exact across `1T..47T`.
+- **`FAST_Q8=1` INT8xINT8 AVX2 + F16C engine + zero-libc thread pool:** quantizes activations to Q8_0 once per matmul, runs a 1-row sequential 4-block (`128B`) `vpabsb`+`vpsignb`+`vpmaddubsw`+`vpmaddwd` kernel with monotonic next-row prefetch, auto-detects `.asmbin` v2 FP16 scales (`vcvtph2ps`) and legacy v1 FP32 scales, runs parallel GQA attention over a contiguous head-major KV-cache, and synchronizes workers via a hybrid spin-then-futex lock-free thread pool (`0%` idle CPU in `--chat`). **126.8 tok/s** peak decode (**20.7 tok/s** 1T) on AMD EPYC 7642 — **+18% to +36% faster than `llama.cpp` CPU (`Q8_0`) across `1..40T`**, bit-exact across all thread counts.
 
 ---
 
 ## Prerequisites
 
-- Linux x86-64 CPU with **AVX2 + FMA**.
+- Linux x86-64 CPU with **AVX2 + FMA + F16C** (Intel Haswell / AMD Excavator or newer; no AVX-512 or VNNI required).
 - Build tools:
   ```bash
   sudo apt install nasm binutils
@@ -41,27 +41,41 @@ hf download Qwen/Qwen3-0.6B \
 
 ### 2. Export Weights to `.asmbin` (Q8_0)
 
-Convert the BF16 safetensors and `tokenizer.json` into a single 64-byte aligned, directly `mmap()`-able `.asmbin` file (`649.18 MiB`):
+Convert the BF16 safetensors and `tokenizer.json` into a single 64-byte aligned, directly `mmap()`-able `.asmbin` file:
 
 ```bash
+# Compact v2 format with IEEE-754 FP16 block scales (default, 613.66 MiB — saves ~35.5 MiB/tok RAM bandwidth)
 python3 scripts/export_weights.py \
   --model-dir models/qwen3-0.6b-bf16 \
-  --out models/qwen3-0.6b-q8_0.asmbin
+  --out models/qwen3-0.6b-q8_0.asmbin \
+  --scale-dtype fp16
+
+# Legacy v1 format with FP32 block scales (649.18 MiB)
+python3 scripts/export_weights.py \
+  --model-dir models/qwen3-0.6b-bf16 \
+  --out models/qwen3-0.6b-q8_0-fp32s.asmbin \
+  --scale-dtype fp32
 ```
 
-### 3. Build the 13 KB Pure x86-64 Binary
+Both formats are auto-detected at load time (`model_init`) by `HDR_VERSION` / `HDR_FLAGS` in both `FAST_Q8=1` and `FAST_Q8=0` builds.
 
-From the repository root:
+### 3. Build the 14 KB Pure x86-64 Binary
+
+From the repository root, choose the compile-time `FAST_Q8` mode (`FAST_Q8=1` is the default):
 
 ```bash
-make inference test-math
+# Default fast path: INT8xINT8 AVX2+F16C matmul + parallel GQA attention + contiguous KV-cache (14,712 B)
+make inference test-math FAST_Q8=1
 make check
+
+# Legacy reference path: exact Q8_0 x FP32 activations (14,008 B)
+make inference test-math FAST_Q8=0
 ```
 
-Expected ELF inspection output:
+Expected ELF inspection output (`FAST_Q8=1`):
 
 ```text
--rwxr-xr-x 1 user user 13528 build/asm-llm
+-rwxr-xr-x 1 user user 14712 build/asm-llm
 build/asm-llm: ELF 64-bit LSB executable, x86-64, version 1 (SYSV), statically linked, stripped
 There is no dynamic section in this file.
 ```
@@ -114,16 +128,16 @@ There is no dynamic section in this file.
 
 ---
 
-## `.asmbin` Binary Format (Version 1)
+## `.asmbin` Binary Format (v2 FP16 Scales & v1 FP32 Scales)
 
 Designed for zero-copy `mmap()` with **64-byte alignment** for every section, matrix, and row:
 
-- **Header (128 bytes):** magic `"ASML"`, version `1`, model dimensions (`dim=1024`, `hidden_dim=3072`, `n_layers=28`, `n_heads=16`, `n_kv_heads=8`, `head_dim=128`, `vocab_size=151936`, `rms_norm_eps=1e-6`, `rope_theta=1e6`, EOS tokens `151645`/`151643`), hash table mask, flags, and 64-byte aligned section offsets.
+- **Header (128 bytes):** magic `"ASML"`, version `2` (FP16 scales, `HDR_FLAG_FP16_SCALES = 4`) or `1` (legacy FP32 scales), model dimensions (`dim=1024`, `hidden_dim=3072`, `n_layers=28`, `n_heads=16`, `n_kv_heads=8`, `head_dim=128`, `vocab_size=151936`, `rms_norm_eps=1e-6`, `rope_theta=1e6`, EOS tokens `151645`/`151643`), hash table mask, flags, and 64-byte aligned section offsets.
 - **Tokenizer section (~9.5 MiB):** `byte_to_tok[256]`, `tok_offsets[vocab_size+1]`, raw UTF-8 `tok_bytes` pool (`976,309` B), and a pre-built `524,288`-slot open-addressing merge table (`151,387` merges, load factor `0.289`, avg probe `1.20`).
-- **Tied Embeddings / LM Head (`[151936, 1024]` Q8_0):** verified bit-identical in BF16 (`max_diff = 0.0`), stored once (`166.92 MiB`).
-- **28 Transformer Layers (`stride = 17,703,936 B` each):** 4 FP32 norm vectors (`input_layernorm`, `q_norm`, `k_norm`, `post_attention_layernorm`) followed by 7 per-row split Q8_0 matrices (`q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`, `up_proj`, `down_proj`). Contiguous layout allows fused QKV (`[4096, 1024]`) and gate+up (`[6144, 1024]`) matmuls in a single thread-pool barrier.
-- **Per-row split Q8_0:** each row of `K` weights stores `[K int8 in -127..127][K/32 fp32 scales]`. For `K in {1024, 2048, 3072}`, row strides are `{1152, 2304, 3456}` bytes, all exact multiples of 64 bytes.
-- **Total size:** `680,718,528` bytes (`649.18 MiB`) vs `1.40 GiB` BF16 safetensors.
+- **Tied Embeddings / LM Head (`[151936, 1024]` Q8_0):** verified bit-identical in BF16 (`max_diff = 0.0`), stored once (`157.65 MiB` in v2 / `166.92 MiB` in v1).
+- **28 Transformer Layers (`stride = 16,720,896 B` v2 / `17,703,936 B` v1):** 4 FP32 norm vectors (`input_layernorm`, `q_norm`, `k_norm`, `post_attention_layernorm`) followed by 7 per-row split Q8_0 matrices (`q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`, `up_proj`, `down_proj`). Contiguous layout allows fused QKV (`[4096, 1024]`) and gate+up (`[6144, 1024]`) matmuls in a single thread-pool barrier.
+- **Per-row split Q8_0:** each row of `K` weights stores `[K int8 in -127..127][K/32 scales]`. For `K in {1024, 2048, 3072}`, row strides are `{1088, 2176, 3264}` B in v2 (`--scale-dtype fp16`) and `{1152, 2304, 3456}` B in v1 (`--scale-dtype fp32`) — all exact multiples of 64 bytes.
+- **Total size:** `643,469,504` bytes (`613.66 MiB`) in v2 (`680,718,528` B / `649.18 MiB` in v1) vs `1.40 GiB` BF16 safetensors.
 
 ---
 
@@ -143,7 +157,8 @@ python3 scripts/test_math.py build/test_math
 | `init_rope_freqs` (FP64) | Max abs error (`theta=1e6`, 64 freqs) | `4.366e-14` | `< 1e-12` |
 | `rmsnorm_avx2` | Max abs error (`n=128`) | `2.056e-07` | `< 1e-6` |
 | `silu_mul_avx2` | Max rel error (`[-150, +150]`, overflow-free) | `6.774e-08` | `< 1e-6` |
-| `matmul_q8_0_range` | Max abs error (`8x64` Q8_0 x FP32) | `9.537e-07` | `< 1e-5` |
+| `matmul_q8_0_range` (`FAST_Q8=1`, v1/v2) | Max abs error vs exact Q8_0xQ8_0 ref | `9.537e-07` / `5.960e-07` | `< 1e-5` |
+| `matmul_q8_0_range` (`FAST_Q8=0`, v1/v2) | Max abs error vs exact Q8_0xFP32 ref | `9.537e-07` / `9.537e-07` | `< 1e-5` |
 
 ### 2. End-to-End Logits & 64-Token Greedy Parity
 
@@ -155,34 +170,34 @@ python3 scripts/verify_ref.py \
   --threads 16
 ```
 
-Prompt: `"Explain the difference between L1, L2, and L3 CPU caches and why cache locality matters."` (`34` prompt tokens, `64` generated tokens):
+Prompt: `"Explain the difference between L1, L2, and L3 CPU caches and why cache locality matters."` (`34` prompt tokens, `64` generated tokens, `.asmbin` v2 FP16 scales):
 
 | Comparison | Tokenizer Match | `max_abs_diff` | `mean_abs_diff` | `cosine_similarity` | Greedy Match |
 |---|---|---:|---:|---:|---|
-| **`build/asm-llm` vs Python `.asmbin` Q8_0 ref** | **Exact (34/34)** | **`0.0000167`** | **`0.0000030`** | **`1.000000000`** | **64/64 tokens (100%)** |
-| Python `.asmbin` Q8_0 vs PyTorch FP32 `Qwen3-0.6B` | **Exact (34/34)** | `0.427719` | `0.075629` | `0.9998471` | **64/64 tokens (100%)** |
+| **`asm-llm` (`FAST_Q8=1`, INT8xINT8) vs PyTorch FP32** | **Exact (34/34)** | `0.603448` | `0.099726` | **`0.9996517`** | **64/64 tokens (100%)** |
+| **`asm-llm` (`FAST_Q8=1`, INT8xINT8) vs Python v2 Q8_0 ref** | **Exact (34/34)** | `0.583087` | `0.121621` | **`0.9996510`** | **64/64 tokens (100%)** |
+| **`asm-llm` (`FAST_Q8=0`, Q8_0xFP32) vs Python v2 Q8_0 ref** | **Exact (34/34)** | **`0.0000153`** | **`0.0000024`** | **`1.000000000`** | **64/64 tokens (100%)** |
+| Python `.asmbin` v2 (FP16 scales) vs PyTorch FP32 | **Exact (34/34)** | `0.452851` | `0.080212` | `0.9998394` | **64/64 tokens (100%)** |
 
-All three implementations (PyTorch FP32, Python Q8_0 reference, and the 12 KB assembly ELF) produce the exact same 64 greedy tokens.
+All configurations (PyTorch FP32, Python Q8_0 reference, `FAST_Q8=0`, and `FAST_Q8=1`) produce the exact same 64 greedy tokens, and outputs are bit-for-bit identical across `1..40` threads.
 
 ---
 
-## Benchmarks (AMD EPYC 7642, 47C Online, 256 MiB L3, DDR4)
+## Benchmarks: `llm.asm` vs `llama.cpp` CPU (`Q8_0`, AMD EPYC 7642)
 
-37 prompt tokens, 64 generated tokens, greedy decoding (`-n 64`), verified bit-for-bit identical across all thread counts:
+Head-to-head decode comparison on **AMD EPYC 7642** (47C online, 256 MiB L3, DDR4, CPU-only `-ngl 0`), `Qwen3-0.6B Q8_0`, `34` prompt tokens / `64` generated tokens, `3`-run mean (greedy, bit-for-bit identical across all thread counts):
 
-| Threads | Prefill (ms) | Prefill (`tok/s`) | Decode (ms) | Decode (`tok/s`) | Speedup vs 1T (Decode) | Determinism |
+| Threads | `asm-llm` `FAST_Q8=0` (v1 FP32s) | `llama.cpp` `llama-bench -ngl 0` (`Q8_0`) | **`asm-llm` `FAST_Q8=1` (v2 FP16s)** | **Speedup vs `FAST_Q8=0`** | **vs `llama.cpp`** | Determinism |
 |---:|---:|---:|---:|---:|---:|---|
-| 1 | 3133.09 | 11.81 | 7910.50 | 7.96 | 1.00x | Baseline (64/64) |
-| 4 | 933.82 | 39.62 | 2330.10 | 27.04 | 3.40x | Exact match |
-| 8 | 461.59 | 80.16 | 1134.25 | 55.54 | 6.98x | Exact match |
-| 12 | 370.08 | 99.98 | 914.84 | 68.86 | 8.65x | Exact match |
-| 16 | 318.88 | 116.03 | 796.55 | 79.09 | 9.94x | Exact match |
-| 24 | 271.67 | 136.20 | 673.23 | 93.58 | 11.76x | Exact match |
-| 32 | 251.00 | 147.41 | 636.52 | 98.98 | 12.43x | Exact match |
-| **40** | **243.91** | **151.70** | **628.88** | **100.18** | **12.59x** | **Exact match** |
-| 47 | 265.49 | 139.36 | 730.02 | 86.30 | 10.84x | Exact match |
+| 1 | 7.18 tok/s | 16.63 ± 0.04 tok/s | **20.70 tok/s** | **2.88x** | **1.24x (+24.5%)** | Exact (64/64) |
+| 4 | 28.12 tok/s | 51.08 ± 0.31 tok/s | **69.24 tok/s** | **2.46x** | **1.36x (+35.6%)** | Exact (64/64) |
+| 8 | 53.09 tok/s | 80.79 ± 0.68 tok/s | **103.64 tok/s** | **1.95x** | **1.28x (+28.3%)** | Exact (64/64) |
+| 16 | 77.50 tok/s | 103.03 ± 0.09 tok/s | **121.86 tok/s** | **1.57x** | **1.18x (+18.3%)** | Exact (64/64) |
+| 24 | 91.88 tok/s | 104.11 ± 0.18 tok/s | **123.72 tok/s** | **1.35x** | **1.19x (+18.8%)** | Exact (64/64) |
+| 32 | 96.63 tok/s | 103.82 ± 0.64 tok/s | **122.51 tok/s** | **1.27x** | **1.18x (+18.0%)** | Exact (64/64) |
+| **40** | **98.50 tok/s** | **105.08 ± 0.08 tok/s** | **125.86 tok/s** *(peak 126.81)* | **1.28x** | **1.20x (+19.8%)** | **Exact (64/64)** |
 
-Peak throughput observed on shorter live prompts at `-t 32`: **154.28 tok/s prefill** and **105.39 tok/s decode**.
+*(Prefill note: `llama-bench` `pp34` uses batched GEMM (`56..1113 tok/s`), while `asm-llm` runs token-by-token GEMV (`26.7..160.8 tok/s` prefill at `1..40T`).)*
 
 ---
 

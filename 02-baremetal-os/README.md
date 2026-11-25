@@ -1,11 +1,11 @@
-# Phase 2: Bare-Metal Bootable Qwen3-0.6B OS in 23 KB of Pure Assembly
+# Phase 2: Bare-Metal Bootable Qwen3-0.6B OS in 24 KB of Pure Assembly
 
 A standalone bootable x86-64 operating system that runs **Qwen/Qwen3-0.6B** directly on hardware or KVM with **no Linux, no Windows, no C, no Rust, and no libc**.
 
-- **23,132 bytes** stripped static Multiboot 1 kernel (`build/asm-llm-os.elf`, `.text` = 16,119 B, `.rodata` = 2,676 B, `.bss` = 2.1 MiB `NOBITS`, zero dynamic dependencies).
-- **85 ms cold boot** to interactive `asm-llm>` multi-turn chat with persistent KV-cache across turns, all SMP cores online, and the 649 MiB model bound zero-copy from physical RAM.
+- **24,252 bytes** stripped static Multiboot 1 kernel (`FAST_Q8=1`, default: `.text` = 17,143 B, `.rodata` = 2,772 B, `.bss` = 2.1 MiB `NOBITS`, zero dynamic dependencies), or **23,612 bytes** (`FAST_Q8=0`, legacy Q8_0xFP32).
+- **74–94 ms cold boot** to interactive `asm-llm>` multi-turn chat with persistent KV-cache across turns, all SMP cores online, and the `.asmbin` v2 (`614 MiB` FP16 scales) or v1 (`649 MiB` FP32 scales) model bound zero-copy from physical RAM on 2 MiB huge pages.
 - **100% token-exact and byte-for-byte parity** with [Phase 1](../01-qwen3-inference/) across `1..32` vCPUs.
-- **100.1 tok/s** decode on QEMU KVM (AMD EPYC 7642, 32 vCPUs) and **55.4 tok/s** live on a **0 GB disk Proxmox VE VM** (Intel Xeon E5-2670 v3, 12 cores).
+- **134.9 tok/s** decode on QEMU KVM (AMD EPYC 7642, 16 vCPUs; **23.7 tok/s** at 1 vCPU, **118.1 tok/s** at 8 vCPUs, **136.6 tok/s** peak) and **55.4 tok/s** live on a **0 GB disk Proxmox VE VM** (Intel Xeon E5-2670 v3, 12 cores).
 
 ![Bare-Metal Qwen3-0.6B OS VGA Console](../assets/baremetal-vga.png)
 
@@ -17,7 +17,7 @@ A standalone bootable x86-64 operating system that runs **Qwen/Qwen3-0.6B** dire
 
 ## Prerequisites
 
-- x86-64 CPU with **AVX2 + FMA**.
+- x86-64 CPU with **AVX2 + FMA + F16C**.
 - Core build & QEMU KVM:
   ```bash
   sudo apt install nasm binutils qemu-system-x86
@@ -26,23 +26,23 @@ A standalone bootable x86-64 operating system that runs **Qwen/Qwen3-0.6B** dire
   ```bash
   sudo apt install grub-pc-bin grub-efi-amd64-bin grub-common mtools xorriso
   ```
-- An exported `models/qwen3-0.6b-q8_0.asmbin` file (see [Phase 1 setup](../01-qwen3-inference/README.md#1-download-qwenqwen3-06b)).
+- An exported `models/qwen3-0.6b-q8_0.asmbin` file (`--scale-dtype fp16` v2 recommended, or legacy v1 `--scale-dtype fp32`; see [Phase 1 setup](../01-qwen3-inference/README.md#1-download-qwenqwen3-06b)).
 
 ---
 
 ## Build
 
-From the repository root:
+From the repository root (`FAST_Q8=1` is enabled by default; pass `FAST_Q8=0` for legacy FP32-activation mode):
 
 ```bash
-make os
+make os FAST_Q8=1
 make os-check
 ```
 
-Expected output:
+Expected output (`FAST_Q8=1`):
 
 ```text
--rwxr-xr-x 1 user user 23132 build/asm-llm-os.elf
+-rwxr-xr-x 1 user user 24252 build/asm-llm-os.elf
 build/asm-llm-os.elf: ELF 32-bit LSB executable, Intel 80386, version 1 (SYSV), statically linked, stripped
 There is no dynamic section in this file.
 ```
@@ -181,11 +181,11 @@ Pass via QEMU `-append "..."`, `make os-run CMDLINE='...'`, or `make os-iso CMDL
 
 ## Architecture Overview
 
-Phase 2 compiles the exact same `shared/math.asm`, `shared/matmul.asm`, `shared/tokenizer.asm`, and `shared/transformer.asm` with `-DBARE_METAL` and pairs them with 4,058 lines of bare-metal OS code:
+Phase 2 compiles the exact same `shared/math.asm`, `shared/matmul.asm`, `shared/tokenizer.asm`, and `shared/transformer.asm` with `-DBARE_METAL -DFAST_Q8=$(FAST_Q8)` and pairs them with 4,167 lines of bare-metal OS code:
 
-- **Boot & Long Mode (`boot.asm`, `linker.ld`):** verifies Multiboot 1 magic (`0x2BADB002`), zeroes `.bss`, builds 4-level 2 MiB huge-page identity tables covering `0..4 GiB` (with `0xFE000000..0xFFFFFFFF` marked Strong Uncacheable for Local APIC MMIO), enters 64-bit Long Mode, installs a 32-entry exception IDT, verifies `XSAVE + AVX + AVX2 + FMA` via CPUID, and initializes `CR0`/`CR4`/`XCR0=7`/`MXCSR`.
-- **Zero-Copy Weights & Physical Arena (`runtime.asm`):** binds the `.asmbin` Multiboot module directly at its physical address (validating `"ASML"` magic) and carves the 449 MiB KV-cache + scratch arena from the largest usable Multiboot memory-map region, zeroing it with AVX2.
-- **Bare-Metal SMP (`smp.asm`):** parses ACPI RSDP -> RSDT/XSDT -> MADT (`"APIC"`) with a Local APIC broadcast fallback, installs a position-independent 16->32->64-bit trampoline at `0x8000`, wakes all AP cores via Local APIC `INIT-SIPI-SIPI`, enables AVX2/FMA/MXCSR identically on every core, and synchronizes `matmul_q8_0` with a lock-free cache-line-isolated spin-barrier.
+- **Boot & Long Mode (`boot.asm`, `linker.ld`):** verifies Multiboot 1 magic (`0x2BADB002`), zeroes `.bss`, builds 4-level 2 MiB huge-page identity tables covering `0..4 GiB` (with `0xFE000000..0xFFFFFFFF` marked Strong Uncacheable for Local APIC MMIO), enters 64-bit Long Mode, installs a 32-entry exception IDT, verifies `XSAVE + AVX + AVX2 + FMA + F16C` via CPUID, and initializes `CR0`/`CR4`/`XCR0=7`/`MXCSR`.
+- **Zero-Copy Weights & Physical Arena (`runtime.asm`):** binds the `.asmbin` (v2 FP16 scales or v1 FP32 scales) Multiboot module directly at its physical address (validating `"ASML"` magic) and carves the 449 MiB KV-cache + scratch arena from the largest usable Multiboot memory-map region, zeroing it with AVX2.
+- **Bare-Metal SMP (`smp.asm`):** parses ACPI RSDP -> RSDT/XSDT -> MADT (`"APIC"`) with a Local APIC broadcast fallback, installs a position-independent 16->32->64-bit trampoline at `0x8000`, wakes all AP cores via Local APIC `INIT-SIPI-SIPI`, enables AVX2/FMA/MXCSR identically on every core, and dispatches both `matmul_q8_0` and `gqa_attn_range` (`FAST_Q8=1`) with a lock-free cache-line-isolated spin-barrier.
 - **Hardware Drivers (`drivers.asm`):**
   - **COM1 Serial (`0x3F8`, 115200 8N1):** raw UTF-8 TX and RX.
   - **80x25 Color VGA (`0xB8000`):** colored boot banner, hardware scrolling, batched CRTC cursor updates, and UTF-8 decoding with Cyrillic-to-ASCII fallback on VGA while streaming raw UTF-8 to COM1.
@@ -205,16 +205,18 @@ python3 scripts/verify_os.py --model models/qwen3-0.6b-q8_0.asmbin --run-dir run
 
 All 5 parity prompts (English technical, English concise, Russian UTF-8, arithmetic word problem, `--think` mode) match Phase 1 (`build/asm-llm`) **100% exact** in prompt tokens, generated tokens, and raw UTF-8 bytes.
 
-### KVM SMP Scaling (AMD EPYC 7642, 34 prompt tok, 64 gen tok, greedy)
+### KVM SMP Scaling (`FAST_Q8=1`, `.asmbin` v2 FP16 Scales, AMD EPYC 7642, 34 prompt tok, 64 gen tok, greedy)
 
 | vCPUs (KVM) | SMP Online | Boot Ready (ms) | Boot -> 1st Tok (ms) | Prefill (ms) | Prefill (`tok/s`) | Decode (ms) | Decode (`tok/s`) | Parity vs Phase 1 |
 |---:|---|---:|---:|---:|---:|---:|---:|---|
-| 1 | 1/1 | 73.57 | 3448.23 | 3358.45 | 10.12 | 8818.57 | 7.14 | **Exact (64/64)** |
-| 4 | 4/4 | 86.60 | 986.89 | 884.18 | 38.45 | 2306.86 | 27.31 | **Exact (64/64)** |
-| 8 | 8/8 | 87.43 | 516.81 | 413.25 | 82.27 | 1128.06 | 55.85 | **Exact (64/64)** |
-| 16 | 16/16 | 84.01 | 383.02 | 282.84 | 120.21 | 780.31 | 80.74 | **Exact (64/64)** |
-| 24 | 24/24 | 98.27 | 347.75 | 233.37 | **145.69** | 674.30 | 93.43 | **Exact (64/64)** |
-| **32** | **32/32** | **94.88** | **359.37** | **248.34** | **136.91** | **632.28** | **99.64** *(peak 100.10)* | **Exact (64/64)** |
+| 1 | 1/1 | 73.47 | 1161.48 | 1071.98 | 31.72 | 2685.04 | **23.46** *(peak 23.67)* | **Exact (64/64)** |
+| 4 | 4/4 | 84.10 | 425.11 | 324.82 | 104.67 | 805.95 | **78.17** *(peak 78.89)* | **Exact (64/64)** |
+| 8 | 8/8 | 84.54 | 316.71 | 215.93 | 157.46 | 529.53 | **118.97** | **Exact (64/64)** |
+| **16** | **16/16** | **84.88** | **312.87** | **211.89** | **160.46** | **466.88** | **134.94** *(peak 136.63)* | **Exact (64/64)** |
+| 24 | 24/24 | 94.27 | 288.75 | 178.32 | **190.67** | 473.44 | **133.07** | **Exact (64/64)** |
+| 32 | 32/32 | 89.84 | 313.82 | 203.53 | 167.05 | 475.72 | **132.43** *(peak 133.75)* | **Exact (64/64)** |
+
+*(Because `boot.asm` identity-maps guest RAM with 2 MiB huge pages, the bare-metal kernel avoids 4 KiB page-table walks across the 614 MiB model and outperforms both Linux `mmap()` Phase 1 and `llama.cpp` CPU `Q8_0` at every thread count.)*
 
 ### Live Proxmox VE VM (Intel Xeon E5-2670 v3, 12 Cores, 2 GiB RAM, 0 GB Disk, BIOS GRUB ISO)
 

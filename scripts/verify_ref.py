@@ -34,7 +34,7 @@ class AsmBinModel:
 
         hdr = struct.unpack_from("<4sIIIIIIIIIffIIIIQQQQQQ", self.buf, 0)
         assert hdr[0] == b"ASML", f"Bad magic: {hdr[0]}"
-        assert hdr[1] == 1, f"Bad version: {hdr[1]}"
+        assert hdr[1] in (1, 2), f"Bad version: {hdr[1]}"
         (
             self.magic,
             self.version,
@@ -60,6 +60,8 @@ class AsmBinModel:
             self.file_size,
         ) = hdr
 
+        self.fp16_scales = bool(self.flags & 4) or (self.version >= 2)
+        self.scale_bytes = 2 if self.fp16_scales else 4
         self.q_dim = self.n_heads * self.head_dim
         self.kv_dim = self.n_kv_heads * self.head_dim
         self._load_tokenizer()
@@ -91,12 +93,15 @@ class AsmBinModel:
 
     def _view_q8_0(self, offset: int, rows: int, cols: int):
         nb = cols // 32
-        row_stride = cols + nb * 4
+        row_stride = cols + nb * self.scale_bytes
         raw = np.frombuffer(self.buf, dtype=np.uint8, count=rows * row_stride, offset=offset).reshape(
             rows, row_stride
         )
         q = raw[:, :cols].view(np.int8)
-        s = np.ascontiguousarray(raw[:, cols:]).view("<f4").reshape(rows, nb)
+        if self.fp16_scales:
+            s = np.ascontiguousarray(raw[:, cols:]).view("<f2").reshape(rows, nb).astype(np.float32)
+        else:
+            s = np.ascontiguousarray(raw[:, cols:]).view("<f4").reshape(rows, nb)
         return q, s
 
     def _load_weights(self):
@@ -118,7 +123,7 @@ class AsmBinModel:
                 nonlocal pos
                 pos = align64(pos)
                 mat = self._view_q8_0(pos, rows, cols)
-                pos += rows * (cols + (cols // 32) * 4)
+                pos += rows * (cols + (cols // 32) * self.scale_bytes)
                 return mat
 
             self.layers.append(
@@ -328,6 +333,8 @@ def main():
     print(f"  gen ids    : {ref_gen}")
     print(f"  decoded    : {model.decode(ref_gen)!r}")
 
+    pt_logits = None
+    pt_gen_clean = None
     if args.compare_pt:
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -420,6 +427,21 @@ def main():
             print(f"  cosine_similarity: {cos:.9f}")
             print(f"  top10_match      : {top10_asm == top10_ref} (asm={top10_asm[:5]}, ref={top10_ref[:5]})")
             print(f"  greedy_match     : {exact_gen} ({match_cnt}/{len(ref_gen)} tokens)")
+            if pt_logits is not None and pt_gen_clean is not None:
+                p_max_d, p_mean_d, p_cos = metrics(asm_logits, pt_logits)
+                p_prefix = 0
+                for a, b in zip(asm_gen_ids or [], pt_gen_clean):
+                    if a == b:
+                        p_prefix += 1
+                    else:
+                        break
+                p_match = sum(1 for a, b in zip(asm_gen_ids or [], pt_gen_clean) if a == b)
+                print(f"\n[Pure x86-64 asm-llm vs PyTorch FP32]")
+                print(f"  max_abs_diff     : {p_max_d:.6f}")
+                print(f"  mean_abs_diff    : {p_mean_d:.6f}")
+                print(f"  cosine_similarity: {p_cos:.7f}")
+                print(f"  top1_match       : {int(np.argmax(asm_logits)) == int(np.argmax(pt_logits))}")
+                print(f"  greedy_prefix    : {p_prefix}/{min(len(asm_gen_ids or []), len(pt_gen_clean))} tokens (pos_match={p_match}/{len(pt_gen_clean)})")
             print(f"  asm stdout       : {proc.stdout!r}")
             print(f"  asm stderr       :\n{proc.stderr.strip()}")
             if not exact_gen:
