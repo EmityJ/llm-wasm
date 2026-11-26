@@ -1,0 +1,1196 @@
+<!doctype html>
+<!--
+基于 https://github.com/alesha-pro/llm.asm
+
+MIT License
+
+Copyright (c) 2026 Alexey Fateev (alesha-pro)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+-->
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="在浏览器里离线运行 Qwen3 的本地对话页。">
+  <title>本地对话 · Qwen3</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: "Segoe UI", "Microsoft YaHei UI", "PingFang SC", system-ui, sans-serif;
+      background: #0c1412;
+      color: #f0f6f1;
+      --panel: #151f1b;
+      --border: #2b3c34;
+      --soft-border: #24342c;
+      --muted: #a2b4a9;
+      --accent: #baf4d5;
+      --on-accent: #142f24;
+      --danger: #ffc0b5;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-width: 280px;
+      min-height: 100vh;
+      background: radial-gradient(ellipse at 17% 0%, #1c2e25 0, #0c1412 50rem);
+    }
+
+    button, textarea, select { font: inherit; }
+    button { cursor: pointer; }
+    button:disabled { cursor: default; }
+    [hidden] { display: none !important; }
+
+    :focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 3px;
+    }
+
+    .sr-only {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip-path: inset(50%);
+      white-space: nowrap;
+    }
+
+    .topbar {
+      border-bottom: 1px solid var(--soft-border);
+      background: #0f1915bd;
+    }
+
+    .topbar-inner, .workspace {
+      width: min(1200px, calc(100% - 56px));
+      margin-inline: auto;
+    }
+
+    .topbar-inner {
+      min-height: 82px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 16px;
+    }
+
+    .brand { display: flex; align-items: center; gap: 13px; }
+    .brand-mark {
+      position: relative;
+      width: 42px;
+      height: 42px;
+      flex: none;
+      border-radius: 12px;
+      background: var(--accent);
+    }
+    .brand-mark::before, .brand-mark::after {
+      position: absolute;
+      content: "";
+      border: 2px solid #254736;
+      border-radius: 4px;
+      width: 13px;
+      height: 11px;
+    }
+    .brand-mark::before { top: 10px; left: 10px; }
+    .brand-mark::after { top: 17px; left: 16px; background: var(--accent); }
+
+    h1, h2, h3, p { margin: 0; }
+    h1 { font-size: 1.2rem; letter-spacing: .02em; }
+    .brand p { margin-top: 4px; color: var(--muted); font-size: .875rem; }
+
+    .status-pill {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      white-space: nowrap;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      background: #18241e;
+      padding: 7px 12px;
+      font-size: .875rem;
+      color: var(--muted);
+    }
+    .status-pill::before {
+      display: block;
+      content: "";
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: #89978e;
+    }
+    .status-pill[data-phase="ready"]::before { background: #9fe7bc; }
+    .status-pill[data-phase="loading"]::before,
+    .status-pill[data-phase="generating"]::before,
+    .status-pill[data-phase="stopping"]::before { background: #e1cd8d; }
+
+    .workspace {
+      display: grid;
+      grid-template-columns: 264px minmax(0, 1fr);
+      gap: 20px;
+      height: calc(100dvh - 130px);
+      min-height: 535px;
+      margin-block: 23px;
+    }
+
+    .sidebar { display: grid; align-content: start; gap: 13px; }
+    .panel { border: 1px solid var(--border); border-radius: 17px; background: var(--panel); }
+    .sidebar .panel { padding: 18px; }
+    h2 { font-size: 1rem; font-weight: 650; }
+    .model-type { margin-top: 13px; font-weight: 650; }
+    .file-name {
+      margin-top: 4px;
+      min-height: 1.4em;
+      overflow-wrap: anywhere;
+      line-height: 1.45;
+      color: var(--muted);
+      font-size: .875rem;
+    }
+    .button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 39px;
+      padding: 7px 13px;
+      border: 1px solid var(--border);
+      border-radius: 9px;
+      color: #edf4ef;
+      background: #223229;
+      font-size: .875rem;
+      font-weight: 650;
+    }
+    .button:hover:not(:disabled) { background: #2b4235; }
+    .button:disabled { color: #879a8e; background: #1c2a23; }
+    .button.primary {
+      border-color: transparent;
+      color: var(--on-accent);
+      background: var(--accent);
+    }
+    .button.primary:hover:not(:disabled) { background: #d2fae5; }
+    .button.primary:disabled { color: #a2b4a9; background: #263b30; }
+    .choose { width: 100%; margin-top: 16px; }
+    progress {
+      display: block;
+      appearance: none;
+      width: 100%;
+      height: 5px;
+      border: 0;
+      border-radius: 99px;
+      color: #a9e8c6;
+      background: #2b3c34;
+    }
+    progress::-webkit-progress-bar { border-radius: 99px; background: #2b3c34; }
+    progress::-webkit-progress-value { border-radius: 99px; background: #a9e8c6; }
+    progress::-moz-progress-bar { border-radius: 99px; background: #a9e8c6; }
+    #load-progress { margin-top: 12px; }
+
+    .field { margin-top: 14px; }
+    .field label, .usage { font-size: .875rem; color: var(--muted); }
+    .select-wrap { position: relative; display: block; margin-top: 6px; }
+    .select-wrap::after {
+      position: absolute;
+      top: 14px;
+      right: 13px;
+      width: 6px;
+      height: 6px;
+      border-right: 1px solid var(--muted);
+      border-bottom: 1px solid var(--muted);
+      content: "";
+      transform: rotate(45deg);
+      pointer-events: none;
+    }
+    select {
+      width: 100%;
+      appearance: none;
+      background: #101a15;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 8px 30px 8px 10px;
+      color: #edf4ef;
+      font-size: .9rem;
+    }
+    .usage {
+      display: flex;
+      justify-content: space-between;
+      gap: 6px;
+      margin: 17px 0 8px;
+    }
+    #usage-text { color: #d9e8dd; font-variant-numeric: tabular-nums; }
+    .local-note { padding: 1px 3px; color: var(--muted); font-size: .875rem; line-height: 1.55; }
+
+    .chat {
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr) auto;
+      min-height: 0;
+      background: #111b16;
+    }
+    .chat-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      min-height: 64px;
+      padding: 12px 23px;
+      border-bottom: 1px solid var(--soft-border);
+    }
+    .chat-scroll { min-width: 0; min-height: 0; overflow: auto; }
+    .empty {
+      min-height: 100%;
+      display: grid;
+      place-items: center;
+      padding: 36px 18px;
+      text-align: center;
+    }
+    .empty-icon {
+      display: block;
+      position: relative;
+      width: 76px;
+      height: 76px;
+      margin: 0 auto 17px;
+      border: 1px solid #355346;
+      border-radius: 22px;
+      background: linear-gradient(145deg, #2a4437, #192c23);
+    }
+    .empty-icon::before, .empty-icon::after {
+      position: absolute;
+      content: "";
+      width: 25px;
+      height: 17px;
+      border: 2px solid #779b83;
+      border-radius: 6px;
+    }
+    .empty-icon::before { top: 19px; left: 17px; }
+    .empty-icon::after { top: 30px; left: 29px; background: #233a2e; border-color: #b6efd1; }
+    .empty h3 { font-size: clamp(1.15rem, 2vw, 1.55rem); letter-spacing: .015em; }
+    .empty p { max-width: 39ch; margin: 8px auto 0; color: var(--muted); line-height: 1.55; }
+
+    .messages {
+      display: grid;
+      gap: 22px;
+      width: min(100%, 810px);
+      margin-inline: auto;
+      padding: 24px 22px 30px;
+    }
+    .message { width: fit-content; max-width: 92%; min-width: 0; }
+    .message.user { justify-self: end; }
+    .speaker { margin-bottom: 6px; color: var(--muted); font-size: .875rem; font-weight: 650; }
+    .user .speaker { text-align: right; }
+    .message-body {
+      padding: 11px 13px;
+      border: 1px solid var(--border);
+      border-radius: 13px;
+      background: #1c2a22;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      line-height: 1.65;
+    }
+    .user .message-body { background: #254236; border-color: #39584a; }
+    .message[aria-busy="true"] .message-body:empty::before { content: "···"; color: var(--muted); }
+    .message-note { margin-top: 6px; color: var(--muted); font-size: .875rem; }
+
+    .composer { border-top: 1px solid var(--soft-border); padding: 13px 22px 18px; }
+    .entry {
+      width: min(100%, 766px);
+      margin-inline: auto;
+      border: 1px solid var(--border);
+      border-radius: 13px;
+      background: #16231c;
+    }
+    .entry:focus-within { border-color: #84b397; }
+    textarea {
+      display: block;
+      width: 100%;
+      min-height: 58px;
+      max-height: 180px;
+      resize: vertical;
+      background: transparent;
+      border: 0;
+      color: #f0f6f1;
+      padding: 12px 13px 3px;
+      line-height: 1.45;
+    }
+    textarea:focus-visible { outline-offset: -3px; border-radius: 12px; }
+    textarea::placeholder { color: #9bab9e; }
+    .compose-actions {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 8px;
+      min-height: 52px;
+      padding: 5px 8px 8px 13px;
+    }
+    #operation { margin-right: auto; color: var(--muted); font-size: .875rem; line-height: 1.35; }
+    #send, #stop { min-width: 65px; }
+    .problem { width: min(100%, 766px); margin: 0 auto 8px; color: var(--danger); line-height: 1.45; font-size: .875rem; }
+
+    @media (max-width: 735px) {
+      .topbar-inner, .workspace { width: calc(100% - 28px); }
+      .topbar-inner { min-height: 70px; }
+      .workspace { grid-template-columns: minmax(0, 1fr); height: auto; min-height: 0; gap: 12px; margin-block: 14px; }
+      .sidebar { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; }
+      .sidebar .panel { padding: 13px; }
+      .local-note { grid-column: 1 / -1; }
+      .chat { min-height: 490px; height: 72dvh; }
+      .chat-header { padding-inline: 14px; }
+      .messages, .composer { padding-inline: 13px; }
+    }
+
+    @media (max-width: 385px) {
+      .sidebar { grid-template-columns: minmax(0, 1fr); }
+      .brand { gap: 8px; }
+      .brand-mark { width: 39px; height: 39px; }
+      .status-pill { padding-inline: 9px; }
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <div>
+          <h1>本地对话</h1>
+          <p>Qwen3 · WebAssembly</p>
+        </div>
+      </div>
+      <p class="status-pill" id="status" role="status" data-phase="empty">未加载模型</p>
+    </div>
+  </header>
+
+  <main class="workspace">
+    <aside class="sidebar" aria-label="模型与推理设置">
+      <section class="panel">
+        <h2>本地模型</h2>
+        <p class="model-type">Qwen3-0.6B · Q8_0</p>
+        <p class="file-name" id="file-name">支持 .asmbin v1 和 v2</p>
+        <input id="model-file" type="file" accept=".asmbin" aria-label="模型权重文件" hidden>
+        <button class="button primary choose" id="choose" type="button">选择权重文件</button>
+        <progress id="load-progress" max="100" value="0" aria-label="模型加载进度" hidden></progress>
+      </section>
+
+      <section class="panel">
+        <h2>推理设置</h2>
+        <div class="field">
+          <label for="reply-limit">回复上限</label>
+          <span class="select-wrap">
+            <select id="reply-limit">
+              <option value="32">32 词元</option>
+              <option value="64">64 词元</option>
+              <option value="128" selected>128 词元</option>
+              <option value="256">256 词元</option>
+            </select>
+          </span>
+        </div>
+        <div class="usage">
+          <span>上下文</span>
+          <output id="usage-text" aria-live="off">—</output>
+        </div>
+        <progress id="usage-meter" max="1" value="0" aria-label="上下文用量"></progress>
+      </section>
+      <p class="local-note">权重和对话都在当前设备处理。</p>
+    </aside>
+
+    <section class="panel chat" aria-labelledby="chat-title">
+      <div class="chat-header">
+        <h2 id="chat-title">对话</h2>
+        <button class="button" id="new-chat" type="button" disabled>新对话</button>
+      </div>
+
+      <div class="chat-scroll" id="chat-scroll" role="region" aria-label="对话记录" tabindex="0">
+        <div class="empty" id="empty">
+          <div>
+            <span class="empty-icon" aria-hidden="true"></span>
+            <h3 id="empty-title">选择模型后开始</h3>
+            <p id="empty-detail">从本机选取已导出的 .asmbin 权重文件。</p>
+          </div>
+        </div>
+        <div class="messages" id="messages" hidden></div>
+      </div>
+
+      <form class="composer" id="composer">
+        <p class="problem" id="problem" role="alert" hidden></p>
+        <div class="entry">
+          <label class="sr-only" for="prompt">消息</label>
+          <textarea id="prompt" rows="2" placeholder="加载模型后可输入消息" disabled></textarea>
+          <div class="compose-actions">
+            <p id="operation" role="status">Shift + Enter 换行</p>
+            <button class="button" id="stop" type="button" hidden>停止</button>
+            <button class="button primary" id="send" type="submit" disabled>发送</button>
+          </div>
+        </div>
+      </form>
+    </section>
+  </main>
+
+  <script id="chat-runtime">const connectChatRuntime = (() => {
+  "use strict";
+const HEADER_SIZE = 128;
+const MODEL_BASE = 128;
+const WASM_PAGE = 65536;
+const MAX_MEMORY = 2 ** 31;
+const MAX_PROMPT_BYTES = 8192;
+const FIB_MULT = 0x9E3779B97F4A7C15n;
+const NO_MERGE = 0xFFFFFFFF;
+const CHAT_TURN_END = [151645, 198];
+
+const align64 = (n) => Math.ceil(n / 64) * 64;
+
+function requireModel(ok, detail) {
+  if (!ok) throw new Error("无效的 ASMBIN 模型（" + detail + "）");
+}
+
+function fits(start, length, lower, upper) {
+  return start >= lower && start <= upper && length <= upper - start;
+}
+
+function readHeader(header) {
+  const view = new DataView(header.buffer);
+  const u32 = (offset) => view.getUint32(offset, true);
+  const f32 = (offset) => view.getFloat32(offset, true);
+  const u64 = (offset) => Number(view.getBigUint64(offset, true));
+  const version = u32(4);
+  const flags = u32(60);
+  requireModel(u32(0) === 0x4C4D5341 && (version === 1 || version === 2), "文件标记或版本");
+  requireModel((flags & 3) === 3, "需要共享词嵌入和输出权重的 Qwen3 QK-Norm 模型");
+
+  const dim = u32(8);
+  const hiddenDim = u32(12);
+  const layerCount = u32(16);
+  const heads = u32(20);
+  const kvHeads = u32(24);
+  const headDim = u32(28);
+  const vocabSize = u32(32);
+  const maxContext = u32(36);
+  const eps = f32(40);
+  const ropeTheta = f32(44);
+  const eos = [u32(48), u32(52)];
+  const hashSlots = u32(56) + 1;
+  const scaleBytes = version === 2 || (flags & 4) ? 2 : 4;
+  const tokenizer = u64(64);
+  const embedding = u64(72);
+  const layers = u64(80);
+  const layerStride = u64(88);
+  const finalNorm = u64(96);
+  const fileSize = u64(104);
+  const qDim = heads * headDim;
+  const kvDim = kvHeads * headDim;
+
+  requireModel(fileSize >= HEADER_SIZE && fileSize <= MAX_MEMORY - MODEL_BASE, "文件大小");
+  requireModel([dim, hiddenDim, layerCount, kvHeads, headDim, qDim, vocabSize, maxContext]
+    .every((n) => n > 0 && n <= fileSize), "模型维度");
+  requireModel(dim % 32 === 0 && hiddenDim % 32 === 0 && qDim % 32 === 0 &&
+    heads % kvHeads === 0 && headDim % 4 === 0, "矩阵或 GQA 维度");
+  requireModel(eos.every((id) => id < vocabSize) &&
+    Number.isFinite(eps) && eps > 0 && Number.isFinite(ropeTheta) && ropeTheta > 0, "结束标记或归一化参数");
+
+  const matrixBytes = (rows, cols) => rows * (cols + cols / 32 * scaleBytes);
+  requireModel([tokenizer, embedding, layers, layerStride, finalNorm].every((n) => n % 64 === 0) &&
+    fits(tokenizer, 64, HEADER_SIZE, embedding) &&
+    fits(embedding, matrixBytes(vocabSize, dim), tokenizer, layers) &&
+    fits(layers, layerStride * layerCount, embedding, finalNorm) &&
+    fits(finalNorm, dim * 4, layers, fileSize), "权重区段");
+
+  // 层内顺序与 scripts/export_weights.py 写入的顺序一致。
+  const layerOffsets = [0, dim * 4, (dim + headDim) * 4, (dim + 2 * headDim) * 4];
+  let layerEnd = (2 * dim + 2 * headDim) * 4;
+  for (const [rows, cols] of [
+    [qDim, dim], [kvDim, dim], [kvDim, dim], [dim, qDim],
+    [hiddenDim, dim], [hiddenDim, dim], [dim, hiddenDim],
+  ]) {
+    const offset = align64(layerEnd);
+    layerOffsets.push(offset);
+    layerEnd = offset + matrixBytes(rows, cols);
+  }
+  requireModel(layerEnd <= layerStride, "层内权重大小");
+
+  return {
+    dim, hiddenDim, layerCount, heads, kvHeads, headDim, vocabSize, maxContext, eps,
+    ropeTheta, eos, hashSlots, scaleBytes, tokenizer, embedding, layers, layerStride,
+    finalNorm, fileSize, qDim, kvDim, layerOffsets,
+  };
+}
+
+function planMemory(model, contextLength) {
+  const {
+    dim, hiddenDim, layerCount, heads, kvHeads, headDim, vocabSize, scaleBytes,
+    embedding, finalNorm, fileSize, qDim, kvDim, layerOffsets,
+  } = model;
+  let end = MODEL_BASE + fileSize;
+  function allocate(bytes) {
+    const ptr = align64(end);
+    end = ptr + bytes;
+    return ptr;
+  }
+
+  const layerTable = allocate(layerCount * layerOffsets.length * 4);
+  const x = allocate(dim * 4);
+  const h = allocate(dim * 4);
+  const q = allocate(qDim * 4);
+  const k = allocate(kvDim * 4);
+  const v = allocate(kvDim * 4);
+  const attention = allocate(qDim * 4);
+  const scores = allocate(contextLength * 4);
+  const gate = allocate(hiddenDim * 4);
+  const up = allocate(hiddenDim * 4);
+  const logits = allocate(vocabSize * 4);
+  const frequencies = allocate(headDim / 2 * 8);
+  const cosines = allocate(headDim / 2 * 4);
+  const sines = allocate(headDim / 2 * 4);
+  const kvBytes = layerCount * contextLength * kvDim * 4;
+  const keys = allocate(kvBytes);
+  const values = allocate(kvBytes);
+
+  // 与 qwen3.wat 的 forward 入口使用相同的字段顺序。
+  const state = [
+    dim, hiddenDim, layerCount, heads, kvHeads, headDim, vocabSize, contextLength,
+    0, scaleBytes, MODEL_BASE + embedding, layerTable, MODEL_BASE + finalNorm,
+    x, h, q, k, v, attention, scores, gate, up, logits, frequencies, cosines, sines, keys, values,
+  ];
+  if (end > MAX_MEMORY) throw new RangeError("权重和 KV 缓存超出此 Wasm 模块的 2 GiB 上限");
+  return { state, end, layerTable, frequencies, logits };
+}
+
+async function loadWeights(memory, source, requestedContext) {
+  if (source instanceof ArrayBuffer) source = new Uint8Array(source);
+  if (source instanceof Uint8Array) source = [source];
+
+  const header = new Uint8Array(HEADER_SIZE);
+  let written = 0;
+  let model, contextLength, layout, bytes;
+  for await (let chunk of source) {
+    if (!(chunk instanceof Uint8Array)) throw new TypeError("模型数据块必须为 Uint8Array");
+    if (!model) {
+      const count = Math.min(chunk.length, HEADER_SIZE - written);
+      header.set(chunk.subarray(0, count), written);
+      written += count;
+      if (written < HEADER_SIZE) continue;
+      model = readHeader(header);
+      contextLength = requestedContext ?? Math.min(512, model.maxContext);
+      if (!Number.isInteger(contextLength) || contextLength < 1 || contextLength > model.maxContext) {
+        throw new RangeError("上下文长度必须为 1 到 " + model.maxContext + " 的整数");
+      }
+      layout = planMemory(model, contextLength);
+      memory.grow(Math.ceil(layout.end / WASM_PAGE) - memory.buffer.byteLength / WASM_PAGE);
+      bytes = new Uint8Array(memory.buffer, MODEL_BASE, model.fileSize);
+      bytes.set(header);
+      chunk = chunk.subarray(count);
+    }
+    requireModel(chunk.length <= model.fileSize - written, "数据超过文件头声明的大小");
+    bytes.set(chunk, written);
+    written += chunk.length;
+  }
+  requireModel(model && written === model.fileSize, "文件不完整");
+  return { model, contextLength, layout, bytes };
+}
+
+function createTokenizer(bytes, model) {
+  const { tokenizer, embedding, hashSlots, vocabSize } = model;
+  const view = new DataView(bytes.buffer, bytes.byteOffset, embedding);
+  const sectionOffset = (offset) => tokenizer + Number(view.getBigUint64(tokenizer + offset, true));
+  const b2t = sectionOffset(0);
+  const offsets = sectionOffset(8);
+  const pieces = sectionOffset(16);
+  const table = sectionOffset(24);
+  requireModel((hashSlots & (hashSlots - 1)) === 0 &&
+    fits(b2t, 256 * 4, tokenizer + 64, offsets) &&
+    fits(offsets, (vocabSize + 1) * 4, b2t, pieces) &&
+    fits(pieces, 0, offsets, table) &&
+    fits(table, hashSlots * 16, pieces, embedding), "分词器区段");
+
+  const offsetOf = (id) => view.getUint32(offsets + id * 4, true);
+  let prev = 0;
+  for (let id = 0; id <= vocabSize; id++) {
+    const offset = offsetOf(id);
+    requireModel(offset >= prev && offset <= table - pieces, "词元字节偏移");
+    prev = offset;
+  }
+  const byteTokens = Array.from({ length: 256 }, (_, b) => view.getUint32(b2t + b * 4, true));
+  requireModel(byteTokens.every((id) => id < vocabSize), "单字节词元 ID");
+
+  const mask = hashSlots - 1;
+  const shift = BigInt(64 - Math.log2(hashSlots));
+  const encoder = new TextEncoder();
+
+  function encode(text, { raw = false, think = false } = {}) {
+    if (typeof text !== "string") throw new TypeError("提示词必须为字符串");
+    if (text.length > MAX_PROMPT_BYTES) throw new RangeError("提示词最多支持 8192 个 UTF-8 字节");
+    const input = encoder.encode(text);
+    if (input.length > MAX_PROMPT_BYTES) throw new RangeError("提示词最多支持 8192 个 UTF-8 字节");
+    const ids = Array.from(input, (byte) => byteTokens[byte]);
+    // 使用与原版相同的字节级 BPE，同排名时先合并左边的词元对。
+    while (ids.length > 1) {
+      let bestRank = NO_MERGE;
+      let bestIndex = -1;
+      let merged = 0;
+      for (let index = 0; index < ids.length - 1; index++) {
+        const key = (BigInt(ids[index]) << 32n) | BigInt(ids[index + 1]);
+        let slot = Number(BigInt.asUintN(64, key * FIB_MULT) >> shift);
+        for (let probes = 0; probes < hashSlots; probes++) {
+          const entry = table + slot * 16;
+          const rank = view.getUint32(entry + 12, true);
+          if (rank === NO_MERGE) break;
+          if (view.getBigUint64(entry, true) === key) {
+            if (rank < bestRank) {
+              bestRank = rank;
+              bestIndex = index;
+              merged = view.getUint32(entry + 8, true);
+            }
+            break;
+          }
+          slot = (slot + 1) & mask;
+        }
+      }
+      if (bestIndex === -1) break;
+      requireModel(merged < vocabSize, "BPE 合并词元 ID");
+      ids.splice(bestIndex, 2, merged);
+    }
+    if (raw) return ids;
+    requireModel(vocabSize > 151668, "缺少 Qwen3 对话模板词元");
+    const prompt = [151644, 872, 198, ...ids, ...CHAT_TURN_END, 151644, 77091, 198];
+    if (!think) prompt.push(151667, 271, 151668, 271);
+    return prompt;
+  }
+
+  function createDecoder() {
+    const decoder = new TextDecoder("utf-8", { ignoreBOM: true });
+    return {
+      push(id) {
+        return decoder.decode(bytes.subarray(pieces + offsetOf(id), pieces + offsetOf(id + 1)), { stream: true });
+      },
+      finish() {
+        return decoder.decode();
+      },
+    };
+  }
+
+  return { encode, createDecoder };
+}
+
+async function loadQwen3(wasmBytes, modelSource, { contextLength: requestedContext } = {}) {
+  const { instance } = await WebAssembly.instantiate(wasmBytes, { math: Math });
+  const { memory, forward } = instance.exports;
+  const { model, contextLength, layout, bytes } = await loadWeights(memory, modelSource, requestedContext);
+  const { encode, createDecoder } = createTokenizer(bytes, model);
+  const config = new DataView(memory.buffer);
+  layout.state.forEach((value, i) => config.setUint32(i * 4, value, true));
+  config.setFloat32(32, model.eps, true);
+  let entry = layout.layerTable;
+  for (let i = 0; i < model.layerCount; i++) {
+    const base = MODEL_BASE + model.layers + i * model.layerStride;
+    for (const offset of model.layerOffsets) {
+      config.setUint32(entry, base + offset, true);
+      entry += 4;
+    }
+  }
+  for (let i = 0; i < model.headDim / 2; i++) {
+    config.setFloat64(layout.frequencies + i * 8, model.ropeTheta ** (-2 * i / model.headDim), true);
+  }
+  const values = new Float32Array(memory.buffer, layout.logits, model.vocabSize);
+  const cachedIds = [];
+  let generating = false;
+
+  function checkedIds(ids) {
+    if (!Array.isArray(ids) && !(ids instanceof Uint32Array)) throw new TypeError("需要词元 ID 数组");
+    if (ids.length === 0 || ids.length > contextLength) {
+      throw new RangeError("提示词元数量必须为 1 到 " + contextLength);
+    }
+    for (const id of ids) {
+      if (!Number.isInteger(id) || id < 0 || id >= model.vocabSize) throw new RangeError("词元 ID 越界");
+    }
+    return Array.from(ids);
+  }
+
+  function* prefill(ids) {
+    const last = ids.length - 1;
+    let pos = 0;
+    // 复用匹配的 KV 前缀，最后一项重新计算以取得这一轮的 logits。
+    while (pos < last && pos < cachedIds.length && cachedIds[pos] === ids[pos]) pos++;
+    cachedIds.length = pos;
+    for (; pos <= last; pos++) {
+      forward(ids[pos], pos, Number(pos === last));
+      cachedIds.push(ids[pos]);
+      yield pos + 1;
+    }
+  }
+
+  function logits(ids) {
+    if (generating) throw new Error("模型正在生成回复");
+    for (const _ of prefill(checkedIds(ids))) {
+      // 消耗全部预填充步骤。
+    }
+    return values.slice();
+  }
+
+  function* generateSteps(ids, maxNewTokens = 32) {
+    if (generating) throw new Error("模型正在生成回复");
+    if (!Number.isSafeInteger(maxNewTokens) || maxNewTokens < 1) {
+      throw new RangeError("生成词元数量必须为正整数");
+    }
+    const prompt = checkedIds(ids);
+    if (prompt.length >= contextLength) throw new RangeError("上下文没有可用于生成的空间");
+    const limit = Math.min(maxNewTokens, contextLength - prompt.length);
+    generating = true;
+    try {
+      for (const position of prefill(prompt)) yield { prefill: position };
+      const decoder = createDecoder();
+      for (let step = 0; step < limit; step++) {
+        let next = 0;
+        for (let i = 1; i < values.length; i++) {
+          if (values[i] > values[next]) next = i;
+        }
+        if (!Number.isFinite(values[next])) throw new Error("推理得到非有限的 logits");
+        if (model.eos.includes(next)) break;
+        yield { tokenId: next, text: decoder.push(next) };
+        if (step + 1 < limit) {
+          forward(next, prompt.length + step, 1);
+          cachedIds.push(next);
+        }
+      }
+      const tail = decoder.finish();
+      if (tail) yield { text: tail };
+    } finally {
+      generating = false;
+    }
+  }
+
+  function generate(ids, maxNewTokens) {
+    const tokenIds = [];
+    let text = "";
+    for (const step of generateSteps(ids, maxNewTokens)) {
+      if (step.tokenId !== undefined) tokenIds.push(step.tokenId);
+      if (step.text) text += step.text;
+    }
+    return { tokenIds, text };
+  }
+
+  return { contextLength, encode, logits, generate, generateSteps };
+}
+
+function createChatRuntime(loadModel, endTurn, wasm, emit) {
+  let model;
+  let history = [];
+  let generating = false;
+  let stopped = false;
+
+  async function load(file) {
+    if (file.size === 0) throw new Error("模型文件为空");
+    let read = 0;
+    let lastPercent = 0;
+    const stream = file.stream().pipeThrough(new TransformStream({
+      transform(chunk, controller) {
+        read += chunk.byteLength;
+        const percent = Math.floor(read / file.size * 100);
+        if (percent >= lastPercent + 2 || percent === 100) {
+          lastPercent = percent;
+          emit({ type: "progress", percent });
+        }
+        controller.enqueue(chunk);
+      },
+    }));
+    model = await loadModel(wasm, stream);
+    emit({ type: "ready", capacity: model.contextLength });
+  }
+
+  async function reply(prompt, maxTokens) {
+    generating = true;
+    stopped = false;
+    try {
+      const ids = [...history, ...model.encode(prompt)];
+      const room = model.contextLength - ids.length - endTurn.length;
+      if (room < 1) {
+        throw new RangeError(history.length
+          ? "这条消息放不进当前上下文。可以缩短消息或开启新对话。"
+          : "消息超过上下文上限，请缩短后发送。");
+      }
+      const limit = Math.min(maxTokens, room);
+      const generated = [];
+      for (const step of model.generateSteps(ids, limit)) {
+        if (step.prefill !== undefined) {
+          if (step.prefill % 4 === 0 || step.prefill === ids.length) {
+            emit({ type: "prefill", position: step.prefill, total: ids.length });
+          }
+        } else {
+          if (step.tokenId !== undefined) generated.push(step.tokenId);
+          emit({ type: "token", text: step.text, used: ids.length + generated.length });
+        }
+        // 每次前向计算后让出执行权，以便刷新页面并接收停止请求。
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        if (stopped) break;
+      }
+      const accepted = !stopped || generated.length > 0;
+      if (accepted) history = [...ids, ...generated, ...endTurn];
+      const reason = stopped ? "stopped" : generated.length < limit ? "eos" : limit === room ? "context" : "limit";
+      emit({ type: "done", accepted, reason, used: history.length });
+    } catch (error) {
+      emit({ type: "reply-error", message: error.message, used: history.length });
+    } finally {
+      generating = false;
+    }
+  }
+
+  return function receive(data) {
+    switch (data.type) {
+      case "load":
+        load(data.file).catch((error) => {
+          const unsupported = typeof WebAssembly === "undefined" || error instanceof WebAssembly.CompileError;
+          const message = unsupported
+            ? "当前页面无法运行内嵌的 WebAssembly。请在支持 Wasm SIMD 的浏览器中打开文件。"
+            : error.message;
+          emit({ type: "load-error", message });
+        });
+        break;
+      case "reply":
+        if (model && !generating) void reply(data.prompt, data.maxTokens);
+        break;
+      case "stop":
+        if (generating) stopped = true;
+        break;
+      case "reset":
+        if (!generating) history = [];
+        break;
+    }
+  };
+}
+
+  const wasm = Uint8Array.from(atob("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"), (c) => c.charCodeAt(0));
+  return (emit) => createChatRuntime(loadQwen3, CHAT_TURN_END, wasm, emit);
+})();
+
+if (typeof document === "undefined") {
+  const receive = connectChatRuntime((data) => self.postMessage(data));
+  self.addEventListener("message", ({ data }) => receive(data));
+}</script>
+  <script>
+    "use strict";
+
+    const byId = (id) => document.getElementById(id);
+    const ui = {
+      status: byId("status"),
+      choose: byId("choose"),
+      file: byId("model-file"),
+      name: byId("file-name"),
+      progress: byId("load-progress"),
+      limit: byId("reply-limit"),
+      usage: byId("usage-text"),
+      meter: byId("usage-meter"),
+      reset: byId("new-chat"),
+      scroll: byId("chat-scroll"),
+      empty: byId("empty"),
+      emptyTitle: byId("empty-title"),
+      emptyDetail: byId("empty-detail"),
+      messages: byId("messages"),
+      composer: byId("composer"),
+      problem: byId("problem"),
+      prompt: byId("prompt"),
+      operation: byId("operation"),
+      stop: byId("stop"),
+      send: byId("send"),
+    };
+
+    const statuses = {
+      empty: "未加载模型",
+      loading: "正在加载模型",
+      ready: "模型已就绪",
+      generating: "正在推理",
+      stopping: "正在停止",
+    };
+    let phase = "empty";
+    let inference;
+    let workerUrl;
+    let useWorker = location.protocol !== "file:";
+    let pending;
+    let capacity = 0;
+    let used = 0;
+
+    function setProblem(text = "") {
+      ui.problem.textContent = text;
+      ui.problem.hidden = !text;
+    }
+
+    function updateUsage() {
+      ui.usage.textContent = capacity ? used + " / " + capacity : "—";
+      ui.meter.max = capacity || 1;
+      ui.meter.value = used;
+    }
+
+    function updateSend() {
+      ui.send.disabled = phase !== "ready" || used === capacity || !ui.prompt.value.trim();
+    }
+
+    function render() {
+      const loading = phase === "loading";
+      const busy = phase === "generating" || phase === "stopping";
+      const loaded = phase === "ready" || busy;
+      const hasMessages = ui.messages.childElementCount > 0;
+      ui.status.textContent = statuses[phase];
+      ui.status.dataset.phase = phase;
+      ui.choose.disabled = loading || busy;
+      ui.choose.textContent = loaded ? "更换权重文件" : "选择权重文件";
+      ui.progress.hidden = !loading;
+      ui.limit.disabled = busy;
+      ui.reset.disabled = phase !== "ready" || !hasMessages;
+      ui.prompt.disabled = !loaded;
+      ui.prompt.placeholder = loaded ? "输入消息，Enter 发送" : "加载模型后可输入消息";
+      ui.stop.hidden = !busy;
+      ui.stop.disabled = phase === "stopping";
+      ui.send.hidden = busy;
+      ui.messages.hidden = !hasMessages;
+      ui.empty.hidden = hasMessages;
+      ui.emptyTitle.textContent = loaded ? "发一条消息" : loading ? "正在加载权重" : "选择模型后开始";
+      ui.emptyDetail.textContent = loaded
+        ? "本轮的消息和回复会保留到下一轮。"
+        : loading ? "加载完成后即可发送消息。" : "从本机选取已导出的 .asmbin 权重文件。";
+      updateSend();
+      updateUsage();
+    }
+
+    function scrollToLatest() {
+      ui.scroll.scrollTop = ui.scroll.scrollHeight;
+    }
+
+    function makeMessage(role, value) {
+      const article = document.createElement("article");
+      article.className = "message " + role;
+      const speaker = document.createElement("p");
+      speaker.className = "speaker";
+      speaker.textContent = role === "user" ? "你" : "Qwen3";
+      const body = document.createElement("div");
+      body.className = "message-body";
+      const text = document.createTextNode(value);
+      const note = document.createElement("p");
+      note.className = "message-note";
+      note.hidden = true;
+      body.append(text);
+      article.append(speaker, body, note);
+      ui.messages.append(article);
+      return { article, text, note };
+    }
+
+    function rollbackReply() {
+      if (!pending) return;
+      pending.user.article.remove();
+      pending.answer.article.remove();
+      if (!ui.prompt.value) ui.prompt.value = pending.prompt;
+      pending = undefined;
+    }
+
+    function finishReply(data) {
+      if (!data.accepted) {
+        rollbackReply();
+      } else {
+        const answer = pending.answer;
+        answer.article.removeAttribute("aria-busy");
+        if (!answer.text.data) answer.text.data = "本次回复没有生成文本。";
+        const notes = {
+          stopped: "已停止",
+          limit: "达到单次回复上限",
+          context: "上下文已满",
+        };
+        answer.note.textContent = notes[data.reason] || "";
+        answer.note.hidden = !answer.note.textContent;
+        pending = undefined;
+      }
+      used = data.used;
+      phase = "ready";
+      if (used === capacity) ui.operation.textContent = "请新建对话以继续";
+      else if (data.reason === "stopped" && !data.accepted) ui.operation.textContent = "已停止，可以重新发送";
+      else ui.operation.textContent = "Shift + Enter 换行";
+      render();
+      if (data.reason === "stopped") ui.prompt.focus({ preventScroll: true });
+    }
+
+    function stopInference() {
+      const previous = inference;
+      inference = undefined;
+      previous?.terminate();
+    }
+
+    function loadFailed(message) {
+      rollbackReply();
+      stopInference();
+      phase = "empty";
+      capacity = 0;
+      used = 0;
+      ui.operation.textContent = "Shift + Enter 换行";
+      setProblem(message);
+      render();
+    }
+
+    function onInferenceMessage(data) {
+      switch (data.type) {
+        case "progress":
+          ui.progress.value = data.percent;
+          ui.status.textContent = "加载模型 " + data.percent + "%";
+          break;
+        case "ready":
+          capacity = data.capacity;
+          phase = "ready";
+          render();
+          ui.prompt.focus({ preventScroll: true });
+          break;
+        case "load-error":
+          loadFailed(data.message);
+          break;
+        case "prefill":
+          if (phase === "generating") ui.operation.textContent = "处理上下文 " + data.position + " / " + data.total;
+          break;
+        case "token": {
+          const follow = ui.scroll.scrollHeight - ui.scroll.scrollTop - ui.scroll.clientHeight < 60;
+          pending.answer.text.appendData(data.text);
+          used = data.used;
+          updateUsage();
+          if (phase === "generating" && ui.operation.textContent !== "正在生成回复") {
+            ui.operation.textContent = "正在生成回复";
+          }
+          if (follow) scrollToLatest();
+          break;
+        }
+        case "done":
+          finishReply(data);
+          break;
+        case "reply-error":
+          finishReply({ accepted: false, used: data.used });
+          setProblem(data.message);
+          break;
+      }
+    }
+
+    function startPageInference(file) {
+      stopInference();
+      useWorker = false;
+      ui.progress.value = 0;
+      ui.status.textContent = statuses.loading;
+      try {
+        const port = {
+          postMessage(data) {
+            setTimeout(() => {
+              if (inference === port) receive(data);
+            }, 0);
+          },
+          terminate() {
+            receive({ type: "stop" });
+          },
+        };
+        const receive = connectChatRuntime((data) => {
+          if (inference === port) onInferenceMessage(data);
+        });
+        inference = port;
+        port.postMessage({ type: "load", file });
+      } catch (error) {
+        loadFailed("无法启动页内推理（" + error.message + "）");
+      }
+    }
+
+    function startWorkerInference(file) {
+      if (!workerUrl) {
+        const source = byId("chat-runtime").textContent;
+        workerUrl = URL.createObjectURL(new Blob([source], { type: "text/javascript" }));
+      }
+      const thread = new Worker(workerUrl);
+      inference = thread;
+      thread.addEventListener("message", ({ data }) => {
+        if (inference === thread) onInferenceMessage(data);
+      });
+      thread.addEventListener("error", (event) => {
+        if (inference !== thread) return;
+        event.preventDefault();
+        if (phase === "loading") startPageInference(file);
+        else loadFailed(event.message || "推理在运行中中断，请重新载入模型。");
+      });
+      thread.postMessage({ type: "load", file });
+    }
+
+    function loadFile(file) {
+      stopInference();
+      pending = undefined;
+      phase = "loading";
+      used = 0;
+      capacity = 0;
+      ui.messages.replaceChildren();
+      ui.progress.value = 0;
+      ui.name.textContent = file.name;
+      ui.operation.textContent = "Shift + Enter 换行";
+      setProblem();
+      render();
+      if (useWorker) {
+        try {
+          startWorkerInference(file);
+          return;
+        } catch {
+          // 浏览器同步拒绝 Worker 时，也用同一个文件启动页内推理。
+        }
+      }
+      startPageInference(file);
+    }
+
+    ui.choose.addEventListener("click", () => ui.file.click());
+    ui.file.addEventListener("change", () => {
+      const file = ui.file.files[0];
+      ui.file.value = "";
+      if (file) loadFile(file);
+    });
+
+    ui.prompt.addEventListener("input", updateSend);
+    ui.prompt.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" && !event.shiftKey && !event.isComposing && event.keyCode !== 229) {
+        event.preventDefault();
+        if (!ui.send.disabled) ui.composer.requestSubmit();
+      }
+    });
+    ui.composer.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const prompt = ui.prompt.value.trim();
+      if (phase !== "ready" || !prompt || used === capacity) return;
+      setProblem();
+      const user = makeMessage("user", prompt);
+      const answer = makeMessage("assistant", "");
+      answer.article.setAttribute("aria-busy", "true");
+      pending = { prompt, user, answer };
+      ui.prompt.value = "";
+      phase = "generating";
+      ui.operation.textContent = "正在处理上下文";
+      render();
+      scrollToLatest();
+      ui.prompt.focus({ preventScroll: true });
+      inference.postMessage({ type: "reply", prompt, maxTokens: Number(ui.limit.value) });
+    });
+
+    ui.stop.addEventListener("click", () => {
+      if (phase !== "generating") return;
+      phase = "stopping";
+      ui.operation.textContent = "正在停止";
+      render();
+      inference.postMessage({ type: "stop" });
+    });
+    ui.reset.addEventListener("click", () => {
+      if (phase !== "ready") return;
+      inference.postMessage({ type: "reset" });
+      ui.messages.replaceChildren();
+      used = 0;
+      ui.operation.textContent = "Shift + Enter 换行";
+      setProblem();
+      render();
+      ui.prompt.focus({ preventScroll: true });
+    });
+    render();
+  </script>
+</body>
+</html>

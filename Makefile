@@ -1,6 +1,8 @@
 NASM    := nasm
 LD      := ld
 OBJCOPY := objcopy
+WAT2WASM ?= wat2wasm
+NODE    ?= node
 
 LDFLAGS := --gc-sections -s -z noexecstack -z noseparate-code
 BUILD   := build
@@ -76,7 +78,7 @@ TRAIN_OBJS := \
 	$(TRAIN_BUILD)/tui.o \
 	$(TRAIN_BUILD)/main.o
 
-.PHONY: all inference test-math check os os-check os-iso os-run train train-check check-all clean
+.PHONY: all inference test-math check os os-check os-iso os-run train train-check wasm wasm-chat check-all clean
 
 all: inference $(TEST) os train
 
@@ -84,6 +86,20 @@ all: inference $(TEST) os train
 inference: $(TARGET)
 
 test-math: $(TEST)
+
+# 独立构建 Qwen3 的 WebAssembly 推理模块。
+wasm: $(BUILD)/qwen3.wasm
+
+$(BUILD)/qwen3.wasm: 04-wasm-inference/qwen3.wat | $(BUILD)
+	$(WAT2WASM) $< -o $@
+
+WASM_DIR := 04-wasm-inference
+
+wasm-chat: $(BUILD)/chat.html
+
+$(BUILD)/chat.html: $(BUILD)/qwen3.wasm $(WASM_DIR)/chat.template.html $(WASM_DIR)/qwen3.mjs \
+                   $(WASM_DIR)/chat-runtime.mjs $(WASM_DIR)/build-chat.mjs LICENSE
+	$(NODE) $(WASM_DIR)/build-chat.mjs
 
 $(BUILD):
 	mkdir -p $(BUILD)
